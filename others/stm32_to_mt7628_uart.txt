@@ -1,0 +1,373 @@
+=====================================================================
+STM32 <-> MT7628N UART AT COMMAND PROTOCOL (FULLY EXPLAINED)
+Version : 1.0
+Target  : STM32 MCU controlling MT7628N (OpenWrt/Linux)
+File    : Single reference document (Notepad++ friendly)
+=====================================================================
+
+
+---------------------------------------------------------------------
+PROTOCOL OVERVIEW
+---------------------------------------------------------------------
+
+- ASCII based AT-command protocol over UART
+- STM32 = MASTER
+- MT7628N = SLAVE
+- Line ending: CRLF (\r\n)
+- One command at a time
+- Async events can arrive at any time
+- Responses end with OK or ERROR
+
+
+---------------------------------------------------------------------
+BOOT AND RESET BEHAVIOR
+---------------------------------------------------------------------
+
+After power-up, hardware reset, or software reset, MT7628N sends:
+
++SYS:BOOT,READY
+
+Meaning:
+- Linux boot complete
+- WiFi (AP + STA) ready
+- Ethernet ready
+- AT daemon running
+
+STM32 MUST wait for this before sending any command.
+Ignore all UART data before this event.
+
+
+---------------------------------------------------------------------
+BASIC AT COMMANDS
+---------------------------------------------------------------------
+
+COMMAND:
+AT
+Purpose:
+- Check AT interface alive
+
+Response:
+OK
+
+
+COMMAND:
+AT+VER?
+Purpose:
+- Query firmware / AT protocol version
+
+Response:
++VER:MT7628N-AT-1.2.0
+OK
+
+
+---------------------------------------------------------------------
+RESET COMMANDS
+---------------------------------------------------------------------
+
+COMMAND:
+AT+RST
+Purpose:
+- Software reset
+
+Behavior:
+- Full Linux reboot
+- Configuration preserved
+
+Response:
+OK
+
+After reboot:
++SYS:BOOT,READY
+
+
+COMMAND:
+AT+FACTORY
+Purpose:
+- Factory reset
+
+Behavior:
+- Clears AP and STA configuration
+- Restores defaults
+- Reboots automatically
+
+Response:
+OK
+
+After reboot:
++SYS:BOOT,READY
+
+
+---------------------------------------------------------------------
+WIFI MODE CONTROL
+---------------------------------------------------------------------
+
+WiFi Modes:
+0 = OFF
+1 = STA
+2 = AP
+3 = AP + STA
+
+COMMAND:
+AT+WIFIMODE=<mode>
+Purpose:
+- Set WiFi mode
+
+Response:
+OK
+
+
+COMMAND:
+AT+WIFIMODE?
+Response:
++WIFIMODE:<0|1|2|3>
+OK
+
+
+---------------------------------------------------------------------
+WIFI ACCESS POINT (AP) CONFIGURATION
+---------------------------------------------------------------------
+
+COMMAND:
+AT+WIFIAPCFG=<SSID>,<PASSWORD>,<SECURITY>
+
+Parameters:
+SSID      : 1 to 32 characters
+PASSWORD  : 8 to 63 characters (ignored if OPEN)
+SECURITY  : OPEN | WPA | WPA2 | WPA_WPA2
+
+Response:
+OK
+
+
+COMMAND:
+AT+WIFIAPCFG?
+
+Purpose:
+- Query AP configuration and current number of connected clients
+
+Response:
++WIFIAPCFG:SSID=<ssid>,SEC=<OPEN|WPA|WPA2|WPA_WPA2>,CLIENTS=<n>
+OK
+
+Where:
+CLIENTS = number of stations currently connected to WiFi AP
+
+
+---------------------------------------------------------------------
+WIFI AP CLIENT STATUS
+---------------------------------------------------------------------
+
+COMMAND:
+AT+WIFIAP?
+
+Purpose:
+- Query detailed WiFi AP client status
+- Returns list of currently connected AP clients
+
+Behavior:
+- Each client is reported on a separate line
+- Order of clients is not guaranteed
+- If no clients are connected, only OK is returned
+
+Response Format:
++WIFIAP:CLIENT,<MAC>,<IP>
+...
+OK
+
+
+Example (2 clients):
+
++WIFIAP:CLIENT,F4:92:BF:01:22:33,192.168.4.23
++WIFIAP:CLIENT,84:C7:EA:9A:10:02,192.168.4.24
+OK
+
+
+Example (no clients):
+
+OK
+
+
+STM32 NOTES:
+- Count +WIFIAP:CLIENT lines for client count
+- MAC is unique client identifier
+- Command is synchronous
+- Async join/leave events may occur anytime
+
+
+---------------------------------------------------------------------
+WIFI STATION (STA) CONFIGURATION WITH SECURITY
+---------------------------------------------------------------------
+
+COMMAND:
+AT+WIFISTACFG=<SSID>,<PASSWORD>,<SECURITY>
+
+Parameters:
+SSID      : 1 to 32 characters
+PASSWORD  : 8 to 63 characters (ignored if OPEN)
+SECURITY  : OPEN | WPA | WPA2 | WPA_WPA2
+
+Response:
+OK
+
+
+COMMAND:
+AT+WIFISTA=1
+Purpose:
+- Connect STA to router
+
+Response:
+OK
+
+
+COMMAND:
+AT+WIFISTA=0
+Purpose:
+- Disconnect STA from router
+
+Response:
+OK
+
+
+COMMAND:
+AT+WIFISTA?
+
+Purpose:
+- Query STA connection status
+
+Connected Response:
++WIFISTA:CONNECTED,IP=<ip>,RSSI=<rssi>,SEC=<security>
+OK
+
+Disconnected Response:
++WIFISTA:DISCONNECTED,REASON=<reason>
+OK
+
+
+---------------------------------------------------------------------
+WIFI ASYNCHRONOUS EVENTS
+---------------------------------------------------------------------
+
+EVENT:
++WIFI:APJOIN,<MAC>,<IP>
+Meaning:
+- Client joined WiFi AP
+
+
+EVENT:
++WIFI:APLEAVE,<MAC>
+Meaning:
+- Client left WiFi AP
+
+
+EVENT:
++WIFI:STACONN,<IP>,<SECURITY>
+Meaning:
+- STA connected to router
+
+
+EVENT:
++WIFI:STADISCONN,<REASON>
+Meaning:
+- STA disconnected from router
+
+
+---------------------------------------------------------------------
+ETHERNET COMMANDS, STATUS AND CLIENT LIST
+---------------------------------------------------------------------
+
+COMMAND:
+AT+ETH?
+
+Purpose:
+- Query Ethernet link status
+- Query interface IP
+- Query number of connected Ethernet clients
+- Query detailed client list with port number
+
+Response when UP:
++ETH:UP,IP=<ip>,CLIENTS=<n>
++ETH:CLIENT,<PORT>,<MAC>,<IP>
+...
+OK
+
+Response when DOWN:
++ETH:DOWN
+OK
+
+Where:
+PORT    = Physical Ethernet port number (starting from 1)
+CLIENTS = Total number of Ethernet clients
+
+
+---------------------------------------------------------------------
+ETHERNET LINK AND CLIENT EVENTS (WITH PORT)
+---------------------------------------------------------------------
+
+EVENT:
++ETH:UP,<PORT>,IP=<ip>
+Meaning:
+- Ethernet link UP on specified port
+- Client count for this port starts from zero
+
+
+EVENT:
++ETH:DOWN,<PORT>
+Meaning:
+- Ethernet link DOWN on specified port
+- All clients on this port are disconnected
+
+
+EVENT:
++ETH:CLIENT,<PORT>,<MAC>,<IP>
+Meaning:
+- New Ethernet client obtained IP
+
+
+EVENT:
++ETH:CLIENT_LEAVE,<PORT>,<MAC>
+Meaning:
+- Ethernet client disconnected
+
+
+---------------------------------------------------------------------
+SAVE CONFIGURATION
+---------------------------------------------------------------------
+
+COMMAND:
+AT+SAVE
+Purpose:
+- Save configuration to non-volatile memory
+
+Response:
+OK
+
+
+---------------------------------------------------------------------
+ERROR RESPONSES
+---------------------------------------------------------------------
+
+ERROR
+
+ERROR:1  INVALID_PARAM
+ERROR:2  BUSY
+ERROR:3  NOT_READY
+ERROR:4  AUTH_FAIL
+ERROR:5  TIMEOUT
+ERROR:6  NOT_SUPPORTED
+
+
+---------------------------------------------------------------------
+STM32 IMPLEMENTATION RULES
+---------------------------------------------------------------------
+
+- Always wait for +SYS:BOOT,READY
+- Send only one command at a time
+- Always wait for OK or ERROR
+- Handle async events at any time
+- Maintain WiFi AP and Ethernet client counters
+- Recommended timeout: 3000 ms
+- Reset parser after reset
+
+=====================================================================
+END OF FILE
+=====================================================================

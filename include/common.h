@@ -1,4 +1,4 @@
-/*
+/*****************************************************************
 *
 *	Copyright (c) 2026
 *	All rights reserved.
@@ -13,28 +13,10 @@
 ****************************************************************
 *	07/02/2026		1.0			Ganesh		Initial Development
 *
-*/
+*****************************************************************/
 
 #ifndef _COMMON_H_
 #define _COMMON_H_
-
-typedef char         		CHAR;
-typedef char         		INT8;
-typedef unsigned char   	UINT8;
-typedef unsigned char   	BOOL;
-typedef short int       	INT16;
-typedef unsigned short  	UINT16;
-typedef int          		INT32;
-typedef unsigned int    	UINT32;
-typedef long long    		INT64;
-typedef unsigned long long  UINT64;
-typedef float				FLOAT;
-typedef double				DOUBLE;
-typedef void				VOID;
-
-#ifndef NULL
-#define NULL ((void *)(0))
-#endif
 
 typedef unsigned char	BYTE;
 typedef unsigned short	WORD;
