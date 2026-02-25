@@ -1,3 +1,21 @@
+/*****************************************************************
+*
+*   Copyright (c) 2026
+*   All rights reserved.
+*
+*   Project         :
+*   Last Updated on :
+*   Author          : Ganesh
+*
+*   Revision History
+****************************************************************
+*   Date            Version     Name        Description
+****************************************************************
+*   25/02/2026      1.0         Ganesh      Initial Split (atcmd)
+*
+*****************************************************************/
+
+/*** Includes ***/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +29,9 @@
 /*============================================================================
  * RESPONSE/EVENT HELPERS
  *============================================================================*/
+/****************************************************************
+* send_response
+****************************************************************/
 static void send_response(uart_inst_t *uart, const char *fmt, ...) {
     char buf[256] = {0};
     va_list args;
@@ -24,6 +45,9 @@ static void send_response(uart_inst_t *uart, const char *fmt, ...) {
 /*============================================================================
  * UCI HELPERS
  *============================================================================*/
+/****************************************************************
+* uci_get_string
+****************************************************************/
 static int uci_get_string(const char *pkg, const char *section, const char *option,
                           char *out, size_t out_len) {
     struct uci_context *ctx = uci_alloc_context();
@@ -48,6 +72,9 @@ static int uci_get_string(const char *pkg, const char *section, const char *opti
     return 0;
 }
 
+/****************************************************************
+* uci_set_string
+****************************************************************/
 static int uci_set_string(const char *pkg, const char *section, const char *option,
                           const char *value) {
     struct uci_context *ctx = uci_alloc_context();
@@ -154,6 +181,9 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
     send_response(uart, "OK");
 }
 
+/****************************************************************
+* cmd_wifiapcfg_query
+****************************************************************/
 /**
  * AT+WIFIAPCFG? - Query AP configuration
  * Response: +WIFIAPCFG:SSID=<ssid>,SEC=<sec>,CLIENTS=<n>
@@ -190,6 +220,9 @@ static void cmd_wifiapcfg_query(uart_inst_t *uart) {
     send_response(uart, "OK");
 }
 
+/****************************************************************
+* cmd_wifimode_set
+****************************************************************/
 /**
  * AT+WIFIMODE=<mode>
  * mode: 0=OFF, 1=STA, 2=AP, 3=AP+STA
@@ -299,6 +332,9 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
  * AT+WIFIMODE? - Query current WiFi mode
  * Response: +WIFIMODE:<0|1|2|3>
  */
+/****************************************************************
+* cmd_wifimode_query
+****************************************************************/
 static void cmd_wifimode_query(uart_inst_t *uart) {
     char mode[8] = "";
     char disabled[8] = "";
@@ -328,6 +364,9 @@ static void cmd_wifimode_query(uart_inst_t *uart) {
     send_response(uart, "OK");
 }
 
+/****************************************************************
+* cmd_debug
+****************************************************************/
 static void cmd_debug(uart_inst_t *uart) {
     char buffer[256];
     FILE *fp;
@@ -365,6 +404,9 @@ static void cmd_debug(uart_inst_t *uart) {
  * AT+WIFIAP? - Get detailed list of connected clients
  * Response: +WIFIAP:CLIENT,<MAC>,<IP> for each client, then OK
  */
+/****************************************************************
+* cmd_wifiap_clients
+****************************************************************/
 static void cmd_wifiap_clients(uart_inst_t *uart) {
     FILE *fp;
     char line[256];
@@ -412,6 +454,9 @@ static void cmd_wifiap_clients(uart_inst_t *uart) {
  * PASSWORD  : 8 to 63 characters (ignored if OPEN)
  * SECURITY  : OPEN | WPA | WPA2 | WPA_WPA2
  */
+/****************************************************************
+* cmd_wifista_cfg
+****************************************************************/
 static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
     char ssid[33] = "";
     char password[64] = "";
@@ -482,6 +527,9 @@ static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
  * AT+WIFISTA=1   Connect STA
  * AT+WIFISTA=0   Disconnect STA
  */
+/****************************************************************
+* cmd_wifista_set
+****************************************************************/
 static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
     int enable = atoi(param);
     char cmd[256];
@@ -510,6 +558,9 @@ static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
 /**
  * AT+WIFISTA? - Query STA connection status
  */
+/****************************************************************
+* cmd_wifista_query
+****************************************************************/
 static void cmd_wifista_query(uart_inst_t *uart) {
     FILE *fp;
     char line[256];
@@ -574,6 +625,9 @@ static void cmd_wifista_query(uart_inst_t *uart) {
 /**
  * AT+ETH?
  */
+/****************************************************************
+* cmd_eth_query
+****************************************************************/
 static void cmd_eth_query(uart_inst_t *uart) {
     FILE *fp;
     char line[256];
@@ -644,6 +698,9 @@ static void cmd_eth_query(uart_inst_t *uart) {
 /**
  * AT+RST - Software reset (Linux reboot)
  */
+/****************************************************************
+* cmd_reset
+****************************************************************/
 static void cmd_reset(uart_inst_t *uart) {
     send_response(uart, "OK");
     system("reboot &");
@@ -652,6 +709,9 @@ static void cmd_reset(uart_inst_t *uart) {
 /**
  * AT+FACTORY - Factory reset and reboot
  */
+/****************************************************************
+* cmd_factory
+****************************************************************/
 static void cmd_factory(uart_inst_t *uart) {
     send_response(uart, "OK");
     system("firstboot -y && reboot &");
@@ -660,6 +720,9 @@ static void cmd_factory(uart_inst_t *uart) {
 /**
  * AT+SAVE - Save configuration
  */
+/****************************************************************
+* cmd_save
+****************************************************************/
 static void cmd_save(uart_inst_t *uart) {
     int ret = system("uci commit");
     if (ret == 0) {
@@ -672,6 +735,9 @@ static void cmd_save(uart_inst_t *uart) {
 /*============================================================================
  * COMMAND DISPATCH
  *============================================================================*/
+/****************************************************************
+* command_callback
+****************************************************************/
 static void command_callback(uart_inst_t *uart, const char *line, void *user_data) {
     (void)user_data;
 
@@ -728,6 +794,9 @@ static void command_callback(uart_inst_t *uart, const char *line, void *user_dat
     }
 }
 
+/****************************************************************
+* atcmd_init
+****************************************************************/
 void atcmd_init(uart_inst_t *uart) {
     uart_register_callback(uart, "", command_callback, NULL);
     send_response(uart, "+SYS:BOOT,READY");

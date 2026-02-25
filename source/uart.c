@@ -1,3 +1,21 @@
+/*****************************************************************
+*
+*   Copyright (c) 2026
+*   All rights reserved.
+*
+*   Project         :
+*   Last Updated on :
+*   Author          : Ganesh
+*
+*   Revision History
+****************************************************************
+*   Date            Version     Name        Description
+****************************************************************
+*   25/02/2026      1.0         Ganesh      Initial Split (uart)
+*
+*****************************************************************/
+
+/*** Includes ***/
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +27,9 @@
 
 #include "uart.h"
 
+/****************************************************************
+* Local Types
+****************************************************************/
 struct uart_inst {
     int         fd;
     char        device[64];
@@ -35,6 +56,9 @@ struct uart_inst {
     int         callback_count;
 };
 
+/****************************************************************
+* uart_baud_to_const
+****************************************************************/
 static speed_t uart_baud_to_const(int baudrate) {
     switch(baudrate) {
         case 115200: return B115200;
@@ -42,6 +66,9 @@ static speed_t uart_baud_to_const(int baudrate) {
     }
 }
 
+/****************************************************************
+* uart_parse_mode
+****************************************************************/
 static int uart_parse_mode(const char *mode, tcflag_t *data_bits, tcflag_t *parity,
                            tcflag_t *stop_bits, tcflag_t *iflags) {
     if (!mode || strlen(mode) != 3) return -1;
@@ -80,6 +107,9 @@ static int uart_parse_mode(const char *mode, tcflag_t *data_bits, tcflag_t *pari
     return 0;
 }
 
+/****************************************************************
+* uart_init
+****************************************************************/
 uart_inst_t* uart_init(size_t rx_buffer_size) {
     uart_inst_t *uart = calloc(1, sizeof(uart_inst_t));
     if (!uart) return NULL;
@@ -95,6 +125,9 @@ uart_inst_t* uart_init(size_t rx_buffer_size) {
     return uart;
 }
 
+/****************************************************************
+* uart_configure
+****************************************************************/
 int uart_configure(uart_inst_t *uart, const char *device, int baudrate, const char *mode) {
     if (!uart || !device || !mode) return -1;
 
@@ -107,6 +140,9 @@ int uart_configure(uart_inst_t *uart, const char *device, int baudrate, const ch
                            &uart->stop_bits, &uart->iflags);
 }
 
+/****************************************************************
+* uart_open
+****************************************************************/
 int uart_open(uart_inst_t *uart) {
     if (!uart || uart->fd >= 0) return -1;
 
@@ -138,11 +174,17 @@ int uart_open(uart_inst_t *uart) {
     return 0;
 }
 
+/****************************************************************
+* uart_write
+****************************************************************/
 ssize_t uart_write(uart_inst_t *uart, const void *data, size_t len) {
     if (!uart || uart->fd < 0) return -1;
     return write(uart->fd, data, len);
 }
 
+/****************************************************************
+* uart_register_callback
+****************************************************************/
 int uart_register_callback(uart_inst_t *uart, const char *pattern,
                            uart_callback_t cb, void *user_data) {
     if (!uart || !pattern || !cb || uart->callback_count >= 16) return -1;
@@ -156,6 +198,9 @@ int uart_register_callback(uart_inst_t *uart, const char *pattern,
     return 0;
 }
 
+/****************************************************************
+* uart_process_events
+****************************************************************/
 void uart_process_events(uart_inst_t *uart) {
     if (!uart || uart->fd < 0) return;
 
@@ -206,6 +251,9 @@ void uart_process_events(uart_inst_t *uart) {
     }
 }
 
+/****************************************************************
+* uart_destroy
+****************************************************************/
 void uart_destroy(uart_inst_t *uart) {
     if (!uart) return;
     if (uart->fd >= 0) close(uart->fd);
@@ -213,6 +261,9 @@ void uart_destroy(uart_inst_t *uart) {
     free(uart);
 }
 
+/****************************************************************
+* uart_get_fd
+****************************************************************/
 int uart_get_fd(uart_inst_t *uart) {
     if (!uart) return -1;
     return uart->fd;

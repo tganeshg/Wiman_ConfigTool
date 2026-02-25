@@ -1,3 +1,21 @@
+/*****************************************************************
+*
+*   Copyright (c) 2026
+*   All rights reserved.
+*
+*   Project         :
+*   Last Updated on :
+*   Author          : Ganesh
+*
+*   Revision History
+****************************************************************
+*   Date            Version     Name        Description
+****************************************************************
+*   25/02/2026      1.0         Ganesh      Initial Split (main)
+*
+*****************************************************************/
+
+/*** Includes ***/
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -9,18 +27,30 @@
 #include "uart.h"
 #include "atcmd.h"
 
+/****************************************************************
+* Definitions
+****************************************************************/
 #define UART_DEVICE     "ttyS1"
 #define UART_BAUD       115200
 #define UART_MODE       "8N1"
 #define RX_BUFFER_SIZE  2048
 
+/****************************************************************
+* Globals
+****************************************************************/
 static volatile int g_running = 1;
 
+/****************************************************************
+* sigint_handler
+****************************************************************/
 static void sigint_handler(int sig) {
     (void)sig;
     g_running = 0;
 }
 
+/****************************************************************
+* Main
+****************************************************************/
 int main(void) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
