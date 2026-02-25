@@ -9,8 +9,8 @@ export STAGING_DIR := ${STAGING_DIR}
 
 CC 		= mipsel-openwrt-linux-gcc
 CFLAGS	= -Wall -Wno-unused-variable -Wunused-but-set-variable -Wpointer-sign
-INCS 	= -I./include -I${STAGING_DIR}/toolchain-mipsel_24kc_gcc-14.3.0_musl/include
-LFLAGS  = -L. -L${STAGING_DIR}/toolchain-mipsel_24kc_gcc-14.3.0_musl/lib -lm -lpthread -lrt
+INCS 	= -I./include -I${STAGING_DIR}/toolchain-mipsel_24kc_gcc-14.3.0_musl/include -I${STAGING_DIR}/target-mipsel_24kc_musl/usr/include
+LFLAGS  = -L. -L${STAGING_DIR}/toolchain-mipsel_24kc_gcc-14.3.0_musl/lib -L${STAGING_DIR}/target-mipsel_24kc_musl/usr/lib -lm -lpthread -lrt -lubox -luci
 
 # change these to set the proper directories where each files should be
 SRCDIR   = source
