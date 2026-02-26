@@ -508,6 +508,44 @@ static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
 }
 
 /**
+ * AT+WIFISTACFG? - Query STA configuration
+ * Response: +WIFISTACFG:SSID=<ssid>,SEC=<OPEN|WPA|WPA2|WPA_WPA2>,PASSWORD=<password>
+ */
+/****************************************************************
+* cmd_wifistacfg_query
+****************************************************************/
+static void cmd_wifistacfg_query(uart_inst_t *uart) {
+    char ssid[33] = "";
+    char encryption[16] = "";
+    char password[64] = "";
+    const char *sta_section = "@wifi-iface[1]";
+    char tmp[8] = "";
+
+    /* Use STA section: [1] if it exists, else [0] */
+    if (uci_get_string("wireless", sta_section, "mode", tmp, sizeof(tmp)) < 0) {
+        sta_section = "@wifi-iface[0]";
+    }
+
+    if (uci_get_string("wireless", sta_section, "ssid", ssid, sizeof(ssid)) < 0) {
+        strcpy(ssid, "");
+    }
+    if (uci_get_string("wireless", sta_section, "encryption", encryption, sizeof(encryption)) < 0) {
+        strcpy(encryption, "none");
+    }
+    if (uci_get_string("wireless", sta_section, "key", password, sizeof(password)) < 0) {
+        strcpy(password, "");
+    }
+
+    const char *sec_str = "OPEN";
+    if (strcmp(encryption, "psk") == 0) sec_str = "WPA";
+    else if (strcmp(encryption, "psk2") == 0) sec_str = "WPA2";
+    else if (strcmp(encryption, "psk-mixed") == 0) sec_str = "WPA_WPA2";
+
+    send_response(uart, "+WIFISTACFG:SSID=%s,SEC=%s,PASSWORD=%s", ssid, sec_str, password);
+    send_response(uart, "OK");
+}
+
+/**
  * AT+WIFISTA=1   Connect STA
  * AT+WIFISTA=0   Disconnect STA
  */
@@ -757,6 +795,9 @@ static void command_callback(uart_inst_t *uart, const char *line, void *user_dat
     }
     else if (strncmp(line, "AT+WIFISTACFG=", 14) == 0) {
         cmd_wifista_cfg(uart, line + 14);
+    }
+    else if (strcmp(line, "AT+WIFISTACFG?") == 0) {
+        cmd_wifistacfg_query(uart);
     }
     else if (strncmp(line, "AT+WIFISTA=", 11) == 0) {
         cmd_wifista_set(uart, line + 11);
