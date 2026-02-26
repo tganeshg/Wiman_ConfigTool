@@ -106,7 +106,9 @@ static int uci_set_string(const char *pkg, const char *section, const char *opti
 
 /*============================================================================
  * AP / STA / ETH / RESET / SAVE COMMANDS
+ * LUCI expects named section "wifinet0" for AP, not @wifi-iface[0]
  *============================================================================*/
+#define AP_IFACE_NAME "wifinet0"
 
 /**
  * AT+WIFIAPCFG=<SSID>,<PASSWORD>,<SECURITY>
@@ -115,6 +117,7 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
     char ssid[33] = "";
     char password[64] = "";
     char security[16] = "";
+    char tmp[8] = "";
 
     int parsed = sscanf(params, "%32[^,],%63[^,],%15s",
                         ssid, password, security);
@@ -123,6 +126,11 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
         send_response(uart, "ERROR:1");  // INVALID_PARAM
         return;
     }
+
+    /* Trim trailing CR/LF from UART line */
+    ssid[strcspn(ssid, "\r\n")] = '\0';
+    password[strcspn(password, "\r\n")] = '\0';
+    security[strcspn(security, "\r\n")] = '\0';
 
     if (strlen(ssid) < 1 || strlen(ssid) > 32) {
         send_response(uart, "ERROR:1");
@@ -155,22 +163,39 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
         return;
     }
 
-    if (uci_set_string("wireless", "@wifi-iface[0]", "ssid", ssid) < 0) {
+    /* Ensure named AP section wifinet0 exists (LUCI format) */
+    if (uci_get_string("wireless", AP_IFACE_NAME, "device", tmp, sizeof(tmp)) < 0) {
+        system("uci set wireless." AP_IFACE_NAME "=wifi-iface");
+        system("uci set wireless." AP_IFACE_NAME ".device='radio0'");
+        system("uci set wireless." AP_IFACE_NAME ".network='lan'");
+        system("uci set wireless." AP_IFACE_NAME ".mode='ap'");
+        system("uci set wireless." AP_IFACE_NAME ".disabled='0'");
+        system("uci commit wireless");
+    }
+
+    if (uci_set_string("wireless", AP_IFACE_NAME, "mode", "ap") < 0) {
         send_response(uart, "ERROR");
         return;
     }
-
-    if (uci_set_string("wireless", "@wifi-iface[0]", "encryption", encryption) < 0) {
+    if (uci_set_string("wireless", AP_IFACE_NAME, "network", "lan") < 0) {
         send_response(uart, "ERROR");
         return;
     }
-
+    if (uci_set_string("wireless", AP_IFACE_NAME, "ssid", ssid) < 0) {
+        send_response(uart, "ERROR");
+        return;
+    }
+    if (uci_set_string("wireless", AP_IFACE_NAME, "encryption", encryption) < 0) {
+        send_response(uart, "ERROR");
+        return;
+    }
     if (strcmp(security, "OPEN") != 0) {
-        if (uci_set_string("wireless", "@wifi-iface[0]", "key", password) < 0) {
+        if (uci_set_string("wireless", AP_IFACE_NAME, "key", password) < 0) {
             send_response(uart, "ERROR");
             return;
         }
     }
+    uci_set_string("wireless", AP_IFACE_NAME, "disabled", "0");
 
     system("uci commit wireless");
     system("wifi >/dev/null 2>&1");
@@ -189,14 +214,15 @@ static void cmd_wifiapcfg_query(uart_inst_t *uart) {
     char ssid[33] = "";
     char encryption[16] = "";
     int clients = 0;
+    const char *ap_sec = AP_IFACE_NAME;
 
-    if (uci_get_string("wireless", "@wifi-iface[0]", "ssid",
-                       ssid, sizeof(ssid)) < 0) {
-        strcpy(ssid, "OpenWrt");
+    if (uci_get_string("wireless", ap_sec, "ssid", ssid, sizeof(ssid)) < 0) {
+        ap_sec = "@wifi-iface[0]";
+        if (uci_get_string("wireless", ap_sec, "ssid", ssid, sizeof(ssid)) < 0) {
+            strcpy(ssid, "OpenWrt");
+        }
     }
-
-    if (uci_get_string("wireless", "@wifi-iface[0]", "encryption",
-                       encryption, sizeof(encryption)) < 0) {
+    if (uci_get_string("wireless", ap_sec, "encryption", encryption, sizeof(encryption)) < 0) {
         strcpy(encryption, "none");
     }
 
@@ -228,6 +254,7 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
     int mode = atoi(param);
     char command[512] = {0};
     char buffer[256] = {0};
+    char tmp[8] = {0};
     FILE *fp = NULL;
     int ret = 0;
 
@@ -236,13 +263,24 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
         return;
     }
 
-    fp = popen("uci get wireless.@wifi-iface[0].disabled 2>/dev/null", "r");
+    /* Ensure wifinet0 exists when switching to AP (mode 2 or 3) */
+    if ((mode == 2 || mode == 3) &&
+        uci_get_string("wireless", AP_IFACE_NAME, "device", tmp, sizeof(tmp)) < 0) {
+        system("uci set wireless." AP_IFACE_NAME "=wifi-iface");
+        system("uci set wireless." AP_IFACE_NAME ".device='radio0'");
+        system("uci set wireless." AP_IFACE_NAME ".network='lan'");
+        system("uci set wireless." AP_IFACE_NAME ".mode='ap'");
+        system("uci set wireless." AP_IFACE_NAME ".disabled='0'");
+        system("uci commit wireless");
+    }
+
+    fp = popen("uci get wireless." AP_IFACE_NAME ".disabled 2>/dev/null", "r");
     if (fp && fgets(buffer, sizeof(buffer), fp)) {
         buffer[strcspn(buffer, "\n")] = '\0';
         pclose(fp);
     }
 
-    fp = popen("uci get wireless.@wifi-iface[0].mode 2>/dev/null", "r");
+    fp = popen("uci get wireless." AP_IFACE_NAME ".mode 2>/dev/null", "r");
     if (fp && fgets(buffer, sizeof(buffer), fp)) {
         buffer[strcspn(buffer, "\n")] = 0;
         pclose(fp);
@@ -250,29 +288,29 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
 
     if (mode == 2) { /* AP only */
         snprintf(command, sizeof(command),
-            "uci set wireless.@wifi-iface[0].mode='ap' 2>&1; "
-            "uci set wireless.@wifi-iface[0].disabled='0' 2>&1; "
+            "uci set wireless." AP_IFACE_NAME ".mode='ap' 2>&1; "
+            "uci set wireless." AP_IFACE_NAME ".disabled='0' 2>&1; "
             "uci set wireless.@wifi-iface[1].disabled='1' 2>&1; "
             "uci commit wireless 2>&1; "
             "wifi >/dev/null 2>&1");
     } else if (mode == 1) { /* STA only */
         snprintf(command, sizeof(command),
-            "uci set wireless.@wifi-iface[0].disabled='1' 2>&1; "
+            "uci set wireless." AP_IFACE_NAME ".disabled='1' 2>&1; "
             "uci set wireless.@wifi-iface[1].mode='sta' 2>&1; "
             "uci set wireless.@wifi-iface[1].disabled='0' 2>&1; "
             "uci commit wireless 2>&1; "
             "wifi >/dev/null 2>&1");
     } else if (mode == 3) { /* AP + STA */
         snprintf(command, sizeof(command),
-            "uci set wireless.@wifi-iface[0].mode='ap' 2>&1; "
-            "uci set wireless.@wifi-iface[0].disabled='0' 2>&1; "
+            "uci set wireless." AP_IFACE_NAME ".mode='ap' 2>&1; "
+            "uci set wireless." AP_IFACE_NAME ".disabled='0' 2>&1; "
             "uci set wireless.@wifi-iface[1].mode='sta' 2>&1; "
             "uci set wireless.@wifi-iface[1].disabled='0' 2>&1; "
             "uci commit wireless 2>&1; "
             "wifi >/dev/null 2>&1");
     } else if (mode == 0) { /* OFF */
         snprintf(command, sizeof(command),
-            "uci set wireless.@wifi-iface[0].disabled='1' 2>&1; "
+            "uci set wireless." AP_IFACE_NAME ".disabled='1' 2>&1; "
             "uci set wireless.@wifi-iface[1].disabled='1' 2>&1; "
             "uci commit wireless 2>&1; "
             "wifi >/dev/null 2>&1");
@@ -289,13 +327,13 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
     }
 
     ret = pclose(fp);
-    fp = popen("uci get wireless.@wifi-iface[0].disabled 2>/dev/null", "r");
+    fp = popen("uci get wireless." AP_IFACE_NAME ".disabled 2>/dev/null", "r");
     if (fp && fgets(buffer, sizeof(buffer), fp)) {
         buffer[strcspn(buffer, "\n")] = 0;
         pclose(fp);
     }
 
-    fp = popen("uci get wireless.@wifi-iface[0].mode 2>/dev/null", "r");
+    fp = popen("uci get wireless." AP_IFACE_NAME ".mode 2>/dev/null", "r");
     if (fp && fgets(buffer, sizeof(buffer), fp)) {
         buffer[strcspn(buffer, "\n")] = 0;
         pclose(fp);
@@ -328,15 +366,16 @@ static void cmd_wifimode_query(uart_inst_t *uart) {
     char disabled1[8] = "";
     int current_mode = 0;
 
-    /* Read AP (iface[0]) state */
-    if (uci_get_string("wireless", "@wifi-iface[0]", "disabled",
-                       disabled0, sizeof(disabled0)) != 0) {
-        strcpy(disabled0, "1");
+    /* Read AP (wifinet0, else @wifi-iface[0]) state */
+    if (uci_get_string("wireless", AP_IFACE_NAME, "disabled", disabled0, sizeof(disabled0)) != 0) {
+        if (uci_get_string("wireless", "@wifi-iface[0]", "disabled", disabled0, sizeof(disabled0)) != 0) {
+            strcpy(disabled0, "1");
+        }
     }
-    if (uci_get_string("wireless", "@wifi-iface[0]", "mode",
-                       mode0, sizeof(mode0)) != 0) {
-        mode0[0] = '\0';
+    if (uci_get_string("wireless", AP_IFACE_NAME, "mode", mode0, sizeof(mode0)) != 0) {
+        uci_get_string("wireless", "@wifi-iface[0]", "mode", mode0, sizeof(mode0));
     }
+    mode0[sizeof(mode0) - 1] = '\0';
 
     /* Read STA (iface[1]) state */
     if (uci_get_string("wireless", "@wifi-iface[1]", "disabled",
