@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <stdarg.h>
 #include <uci.h>
@@ -33,6 +34,38 @@
 * send_response
 ****************************************************************/
 static void send_response(uart_inst_t *uart, const char *fmt, ...) {
+    char buf[256] = {0};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    uart_write(uart, buf, strlen(buf));
+    uart_write(uart, "\r\n", 2);
+}
+
+/** Drain popen stream before pclose to avoid "Broken pipe" from child. */
+static void drain_popen(FILE *fp) {
+    char buf[256];
+    if (fp) while (fgets(buf, sizeof(buf), fp)) {}
+}
+
+/** Parse dnsmasq lease line "timestamp mac ip hostname client_id"; return 1 if mac matches (case-insensitive) and copy ip. */
+static int lease_line_get_ip(const char *lease_line, const char *mac, char *ip_out, size_t ip_len) {
+    unsigned int ts;
+    char mac_buf[18], ip_buf[16];
+    if (sscanf(lease_line, "%u %17s %15s", &ts, mac_buf, ip_buf) < 3)
+        return 0;
+    if (strcasecmp(mac_buf, mac) != 0)
+        return 0;
+    strncpy(ip_out, ip_buf, ip_len - 1);
+    ip_out[ip_len - 1] = '\0';
+    return 1;
+}
+
+/****************************************************************
+* send_event - unsolicited event to STM32 (no OK line)
+****************************************************************/
+static void send_event(uart_inst_t *uart, const char *fmt, ...) {
     char buf[256] = {0};
     va_list args;
     va_start(args, fmt);
@@ -234,8 +267,9 @@ static void cmd_wifiapcfg_query(uart_inst_t *uart) {
 
     FILE *fp = popen("iw dev phy0-ap0 station dump | grep -c 'Station' 2>/dev/null || echo 0", "r");
     char buf[16];
-    if (fp && fgets(buf, sizeof(buf), fp)) {
-        clients = atoi(buf);
+    if (fp) {
+        if (fgets(buf, sizeof(buf), fp)) clients = atoi(buf);
+        drain_popen(fp);
         pclose(fp);
     }
 
@@ -276,14 +310,16 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
     }
 
     fp = popen("uci get wireless." AP_IFACE_NAME ".disabled 2>/dev/null", "r");
-    if (fp && fgets(buffer, sizeof(buffer), fp)) {
-        buffer[strcspn(buffer, "\n")] = '\0';
+    if (fp) {
+        if (fgets(buffer, sizeof(buffer), fp)) buffer[strcspn(buffer, "\n")] = '\0';
+        drain_popen(fp);
         pclose(fp);
     }
 
     fp = popen("uci get wireless." AP_IFACE_NAME ".mode 2>/dev/null", "r");
-    if (fp && fgets(buffer, sizeof(buffer), fp)) {
-        buffer[strcspn(buffer, "\n")] = 0;
+    if (fp) {
+        if (fgets(buffer, sizeof(buffer), fp)) buffer[strcspn(buffer, "\n")] = 0;
+        drain_popen(fp);
         pclose(fp);
     }
 
@@ -300,21 +336,29 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
         system("uci set network.wwan.proto='dhcp' 2>/dev/null");
         system("uci commit network 2>/dev/null");
         if (uci_get_string("wireless", STA_IFACE_NAME, "device", tmp, sizeof(tmp)) < 0) {
+            /* Newly create wifinet1; copy STA credentials only from a section that has mode=sta (never from AP) */
             system("uci set wireless." STA_IFACE_NAME "=wifi-iface");
+            if (uci_get_string("wireless", "@wifi-iface[1]", "mode", tmp, sizeof(tmp)) == 0 && strcmp(tmp, "sta") == 0) {
+                if (uci_get_string("wireless", "@wifi-iface[1]", "ssid", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "ssid", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[1]", "encryption", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "encryption", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[1]", "key", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "key", buffer);
+            } else if (uci_get_string("wireless", "@wifi-iface[0]", "mode", tmp, sizeof(tmp)) == 0 && strcmp(tmp, "sta") == 0) {
+                if (uci_get_string("wireless", "@wifi-iface[0]", "ssid", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "ssid", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[0]", "encryption", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "encryption", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[0]", "key", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "key", buffer);
+            }
+            system("uci commit wireless");
         }
+        /* Only set device/mode/network/disabled; never overwrite ssid/encryption/key (keep WIFISTACFG values) */
         system("uci set wireless." STA_IFACE_NAME ".device='radio0'");
         system("uci set wireless." STA_IFACE_NAME ".mode='sta'");
         system("uci set wireless." STA_IFACE_NAME ".network='wwan'");
-        /* Copy STA credentials from @wifi-iface[1] to wifinet1 if present */
-        if (uci_get_string("wireless", "@wifi-iface[1]", "ssid", buffer, sizeof(buffer)) == 0 && buffer[0]) {
-            uci_set_string("wireless", STA_IFACE_NAME, "ssid", buffer);
-        }
-        if (uci_get_string("wireless", "@wifi-iface[1]", "encryption", buffer, sizeof(buffer)) == 0 && buffer[0]) {
-            uci_set_string("wireless", STA_IFACE_NAME, "encryption", buffer);
-        }
-        if (uci_get_string("wireless", "@wifi-iface[1]", "key", buffer, sizeof(buffer)) == 0 && buffer[0]) {
-            uci_set_string("wireless", STA_IFACE_NAME, "key", buffer);
-        }
         system("uci set wireless." AP_IFACE_NAME ".disabled='1'");
         system("uci set wireless." STA_IFACE_NAME ".disabled='0'");
         system("uci commit wireless");
@@ -329,17 +373,20 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
         system("uci commit network 2>/dev/null");
         if (uci_get_string("wireless", STA_IFACE_NAME, "device", tmp, sizeof(tmp)) < 0) {
             system("uci set wireless." STA_IFACE_NAME "=wifi-iface");
-            system("uci set wireless." STA_IFACE_NAME ".device='radio0'");
-            system("uci set wireless." STA_IFACE_NAME ".mode='sta'");
-            system("uci set wireless." STA_IFACE_NAME ".network='wwan'");
-            if (uci_get_string("wireless", "@wifi-iface[1]", "ssid", buffer, sizeof(buffer)) == 0 && buffer[0]) {
-                uci_set_string("wireless", STA_IFACE_NAME, "ssid", buffer);
-            }
-            if (uci_get_string("wireless", "@wifi-iface[1]", "encryption", buffer, sizeof(buffer)) == 0 && buffer[0]) {
-                uci_set_string("wireless", STA_IFACE_NAME, "encryption", buffer);
-            }
-            if (uci_get_string("wireless", "@wifi-iface[1]", "key", buffer, sizeof(buffer)) == 0 && buffer[0]) {
-                uci_set_string("wireless", STA_IFACE_NAME, "key", buffer);
+            if (uci_get_string("wireless", "@wifi-iface[1]", "mode", tmp, sizeof(tmp)) == 0 && strcmp(tmp, "sta") == 0) {
+                if (uci_get_string("wireless", "@wifi-iface[1]", "ssid", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "ssid", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[1]", "encryption", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "encryption", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[1]", "key", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "key", buffer);
+            } else if (uci_get_string("wireless", "@wifi-iface[0]", "mode", tmp, sizeof(tmp)) == 0 && strcmp(tmp, "sta") == 0) {
+                if (uci_get_string("wireless", "@wifi-iface[0]", "ssid", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "ssid", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[0]", "encryption", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "encryption", buffer);
+                if (uci_get_string("wireless", "@wifi-iface[0]", "key", buffer, sizeof(buffer)) == 0 && buffer[0])
+                    uci_set_string("wireless", STA_IFACE_NAME, "key", buffer);
             }
             system("uci commit wireless");
         }
@@ -369,22 +416,24 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
 
     ret = pclose(fp);
     fp = popen("uci get wireless." AP_IFACE_NAME ".disabled 2>/dev/null", "r");
-    if (fp && fgets(buffer, sizeof(buffer), fp)) {
-        buffer[strcspn(buffer, "\n")] = 0;
+    if (fp) {
+        if (fgets(buffer, sizeof(buffer), fp)) buffer[strcspn(buffer, "\n")] = 0;
+        drain_popen(fp);
         pclose(fp);
     }
 
     fp = popen("uci get wireless." AP_IFACE_NAME ".mode 2>/dev/null", "r");
-    if (fp && fgets(buffer, sizeof(buffer), fp)) {
-        buffer[strcspn(buffer, "\n")] = 0;
+    if (fp) {
+        if (fgets(buffer, sizeof(buffer), fp)) buffer[strcspn(buffer, "\n")] = 0;
+        drain_popen(fp);
         pclose(fp);
     }
 
     fp = popen("ps | grep -E 'hostapd|wpa_supplicant' | grep -v grep", "r");
-    while (fp && fgets(buffer, sizeof(buffer), fp)) {
-        buffer[strcspn(buffer, "\n")] = 0;
+    if (fp) {
+        while (fgets(buffer, sizeof(buffer), fp)) { buffer[strcspn(buffer, "\n")] = 0; }
+        pclose(fp);
     }
-    if (fp) pclose(fp);
 
 send_wifimode_result:
     if (ret == 0) {
@@ -506,10 +555,8 @@ static void cmd_wifiap_clients(uart_inst_t *uart) {
             if (leases) {
                 char lease_line[256];
                 while (fgets(lease_line, sizeof(lease_line), leases)) {
-                    if (strstr(lease_line, mac)) {
-                        sscanf(lease_line, "%*s %*s %15s", ip);
+                    if (lease_line_get_ip(lease_line, mac, ip, sizeof(ip)))
                         break;
-                    }
                 }
                 fclose(leases);
             }
@@ -692,6 +739,47 @@ static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
 }
 
 /**
+ * Discover STA interface: first interface (other than AP iface) that shows "Connected" in iw link.
+ * Writes name to sta_iface_out (max len bytes) and returns 1 if found, else 0.
+ */
+static int get_sta_connected_iface(char *sta_iface_out, size_t len) {
+    FILE *fp;
+    char line[256];
+    char iface[32];
+
+    if (!sta_iface_out || len < 2) return 0;
+    sta_iface_out[0] = '\0';
+
+    fp = popen("iw dev 2>/dev/null | awk '/Interface/ {print $2}'", "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (sscanf(line, "%31s", iface) != 1) continue;
+        if (strcmp(iface, "phy0-ap0") == 0) continue; /* skip AP interface */
+        snprintf(line, sizeof(line), "iw dev %s link 2>/dev/null", iface);
+        FILE *link = popen(line, "r");
+        if (!link) continue;
+        int connected = 0;
+        while (fgets(line, sizeof(line), link)) {
+            if (strstr(line, "Not connected")) { connected = 0; break; }
+            if (strstr(line, "Connected")) connected = 1;
+        }
+        drain_popen(link);
+        pclose(link);
+        if (connected) {
+            strncpy(sta_iface_out, iface, len - 1);
+            sta_iface_out[len - 1] = '\0';
+            drain_popen(fp);
+            pclose(fp);
+            return 1;
+        }
+    }
+    drain_popen(fp);
+    pclose(fp);
+    return 0;
+}
+
+/**
  * AT+WIFISTA? - Query STA connection status
  */
 /****************************************************************
@@ -700,47 +788,41 @@ static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
 static void cmd_wifista_query(uart_inst_t *uart) {
     FILE *fp;
     char line[256];
-    int connected = 0;
+    char sta_iface[32];
 
-    fp = popen("iw dev wlan0 link 2>/dev/null", "r");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "Not connected")) {
-                connected = 0;
-                break;
-            }
-            if (strstr(line, "Connected")) {
-                connected = 1;
-            }
-        }
-        pclose(fp);
-    }
-
-    if (!connected) {
+    if (!get_sta_connected_iface(sta_iface, sizeof(sta_iface))) {
         send_response(uart, "+WIFISTA:DISCONNECTED,REASON=NOT_CONNECTED");
         send_response(uart, "OK");
         return;
     }
 
     char ip[32] = "0.0.0.0";
-    fp = popen("ip -4 addr show wlan0 | awk '/inet /{print $2}' | cut -d/ -f1", "r");
-    if (fp && fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\n")] = 0;
-        if (strlen(line) > 0) {
-            strncpy(ip, line, sizeof(ip) - 1);
-            ip[sizeof(ip) - 1] = '\0';
+    snprintf(line, sizeof(line), "ip -4 addr show %s 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1", sta_iface);
+    fp = popen(line, "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\n")] = 0;
+            if (strlen(line) > 0) {
+                strncpy(ip, line, sizeof(ip) - 1);
+                ip[sizeof(ip) - 1] = '\0';
+            }
         }
+        drain_popen(fp);
         pclose(fp);
     }
 
     char rssi[16] = "0";
-    fp = popen("iw dev wlan0 link | awk '/signal:/ {print $2}'", "r");
-    if (fp && fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\n")] = 0;
-        if (strlen(line) > 0) {
-            strncpy(rssi, line, sizeof(rssi) - 1);
-            rssi[sizeof(rssi) - 1] = '\0';
+    snprintf(line, sizeof(line), "iw dev %s link 2>/dev/null | awk '/signal:/ {print $2}'", sta_iface);
+    fp = popen(line, "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\n")] = 0;
+            if (strlen(line) > 0) {
+                strncpy(rssi, line, sizeof(rssi) - 1);
+                rssi[sizeof(rssi) - 1] = '\0';
+            }
         }
+        drain_popen(fp);
         pclose(fp);
     }
 
@@ -758,6 +840,144 @@ static void cmd_wifista_query(uart_inst_t *uart) {
     send_response(uart, "+WIFISTA:CONNECTED,IP=%s,RSSI=%s,SEC=%s",
                   ip, rssi, sec_str);
     send_response(uart, "OK");
+}
+
+/*============================================================================
+ * WIFI ASYNCHRONOUS EVENTS (APJOIN, APLEAVE, STACONN, STADISCONN)
+ *============================================================================*/
+#define WIFI_EVENT_AP_CLIENTS_MAX  32
+
+static struct {
+    char ap_macs[WIFI_EVENT_AP_CLIENTS_MAX][18];
+    char ap_ips[WIFI_EVENT_AP_CLIENTS_MAX][16];
+    int  ap_count;
+    int  sta_connected;
+    char sta_ip[32];
+    char sta_sec[16];
+} wifi_event_prev;
+
+static void wifi_event_get_ap_clients(char macs[][18], char ips[][16], int *count) {
+    FILE *fp;
+    char line[256];
+    *count = 0;
+
+    fp = popen("iw dev phy0-ap0 station dump 2>/dev/null | grep Station | awk '{print $2}'", "r");
+    if (!fp) return;
+
+    while (*count < WIFI_EVENT_AP_CLIENTS_MAX && fgets(line, sizeof(line), fp)) {
+        line[strcspn(line, "\n")] = '\0';
+        if (strlen(line) < 17) continue;
+        strncpy(macs[*count], line, 17);
+        macs[*count][17] = '\0';
+        strcpy(ips[*count], "0.0.0.0");
+        FILE *leases = fopen("/tmp/dhcp.leases", "r");
+        if (leases) {
+            char lease_line[256];
+            while (fgets(lease_line, sizeof(lease_line), leases)) {
+                if (lease_line_get_ip(lease_line, macs[*count], ips[*count], 16))
+                    break;
+            }
+            fclose(leases);
+        }
+        (*count)++;
+    }
+    drain_popen(fp);
+    pclose(fp);
+}
+
+static int wifi_event_get_sta_state(char *ip, size_t ip_len, char *sec, size_t sec_len) {
+    FILE *fp;
+    char line[256];
+    char sta_iface[32];
+
+    if (ip_len) ip[0] = '\0';
+    if (sec_len) sec[0] = '\0';
+
+    if (!get_sta_connected_iface(sta_iface, sizeof(sta_iface)))
+        return 0;
+
+    snprintf(line, sizeof(line), "ip -4 addr show %s 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1", sta_iface);
+    fp = popen(line, "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\n")] = '\0';
+            strncpy(ip, line, ip_len - 1);
+            ip[ip_len - 1] = '\0';
+        }
+        drain_popen(fp);
+        pclose(fp);
+    }
+
+    if (uci_get_string("wireless", STA_IFACE_NAME, "encryption", sec, sec_len) != 0) {
+        uci_get_string("wireless", "@wifi-iface[1]", "encryption", sec, sec_len);
+    }
+    if (sec[0]) {
+        if (strcmp(sec, "psk") == 0) strncpy(sec, "WPA", sec_len - 1);
+        else if (strcmp(sec, "psk2") == 0) strncpy(sec, "WPA2", sec_len - 1);
+        else if (strcmp(sec, "psk-mixed") == 0) strncpy(sec, "WPA_WPA2", sec_len - 1);
+    } else {
+        strncpy(sec, "OPEN", sec_len - 1);
+    }
+    sec[sec_len - 1] = '\0';
+    return 1;
+}
+
+static int wifi_event_mac_in_list(const char *mac, char macs[][18], int count) {
+    for (int i = 0; i < count; i++) {
+        if (strcasecmp(mac, macs[i]) == 0) return 1;
+    }
+    return 0;
+}
+
+/****************************************************************
+* wifi_events_poll - call from main loop; emits +WIFI:APJOIN/APLEAVE/STACONN/STADISCONN
+****************************************************************/
+void wifi_events_poll(uart_inst_t *uart) {
+    char cur_macs[WIFI_EVENT_AP_CLIENTS_MAX][18];
+    char cur_ips[WIFI_EVENT_AP_CLIENTS_MAX][16];
+    int cur_ap = 0, i;
+    int cur_sta = 0;
+    char cur_sta_ip[32] = "";
+    char cur_sta_sec[16] = "OPEN";
+
+    wifi_event_get_ap_clients(cur_macs, cur_ips, &cur_ap);
+    cur_sta = wifi_event_get_sta_state(cur_sta_ip, sizeof(cur_sta_ip), cur_sta_sec, sizeof(cur_sta_sec));
+
+    /* APJOIN: in current, not in previous */
+    for (i = 0; i < cur_ap; i++) {
+        if (!wifi_event_mac_in_list(cur_macs[i], wifi_event_prev.ap_macs, wifi_event_prev.ap_count)) {
+            send_event(uart, "+WIFI:APJOIN,%s,%s", cur_macs[i], cur_ips[i]);
+        }
+    }
+    /* APLEAVE: in previous, not in current */
+    for (i = 0; i < wifi_event_prev.ap_count; i++) {
+        if (!wifi_event_mac_in_list(wifi_event_prev.ap_macs[i], cur_macs, cur_ap)) {
+            send_event(uart, "+WIFI:APLEAVE,%s", wifi_event_prev.ap_macs[i]);
+        }
+    }
+
+    /* STACONN: just connected (got IP) */
+    if (cur_sta && (!wifi_event_prev.sta_connected || strcmp(wifi_event_prev.sta_ip, cur_sta_ip) != 0)) {
+        send_event(uart, "+WIFI:STACONN,%s,%s", cur_sta_ip, cur_sta_sec);
+    }
+    /* STADISCONN: just disconnected */
+    if (wifi_event_prev.sta_connected && !cur_sta) {
+        send_event(uart, "+WIFI:STADISCONN,NOT_CONNECTED");
+    }
+
+    /* update previous state */
+    wifi_event_prev.ap_count = cur_ap;
+    for (i = 0; i < cur_ap; i++) {
+        strncpy(wifi_event_prev.ap_macs[i], cur_macs[i], 17);
+        wifi_event_prev.ap_macs[i][17] = '\0';
+        strncpy(wifi_event_prev.ap_ips[i], cur_ips[i], 15);
+        wifi_event_prev.ap_ips[i][15] = '\0';
+    }
+    wifi_event_prev.sta_connected = cur_sta;
+    strncpy(wifi_event_prev.sta_ip, cur_sta_ip, sizeof(wifi_event_prev.sta_ip) - 1);
+    wifi_event_prev.sta_ip[sizeof(wifi_event_prev.sta_ip) - 1] = '\0';
+    strncpy(wifi_event_prev.sta_sec, cur_sta_sec, sizeof(wifi_event_prev.sta_sec) - 1);
+    wifi_event_prev.sta_sec[sizeof(wifi_event_prev.sta_sec) - 1] = '\0';
 }
 
 /**
@@ -787,12 +1007,15 @@ static void cmd_eth_query(uart_inst_t *uart) {
 
     char ip[32] = "0.0.0.0";
     fp = popen("ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1", "r");
-    if (fp && fgets(line, sizeof(line), fp)) {
-        line[strcspn(line, "\n")] = 0;
-        if (strlen(line) > 0) {
-            strncpy(ip, line, sizeof(ip) - 1);
-            ip[sizeof(ip) - 1] = '\0';
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\n")] = 0;
+            if (strlen(line) > 0) {
+                strncpy(ip, line, sizeof(ip) - 1);
+                ip[sizeof(ip) - 1] = '\0';
+            }
         }
+        drain_popen(fp);
         pclose(fp);
     }
 

@@ -91,6 +91,7 @@ int main(void) {
         if (ret > 0 && FD_ISSET(fd, &read_fds)) {
             uart_process_events(uart);
         }
+        wifi_events_poll(uart);
     }
 
     uart_destroy(uart);
