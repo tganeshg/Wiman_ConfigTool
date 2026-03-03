@@ -92,6 +92,7 @@ int main(void) {
             uart_process_events(uart);
         }
         wifi_events_poll(uart);
+        eth_events_poll(uart);
     }
 
     uart_destroy(uart);

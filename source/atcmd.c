@@ -980,8 +980,117 @@ void wifi_events_poll(uart_inst_t *uart) {
     wifi_event_prev.sta_sec[sizeof(wifi_event_prev.sta_sec) - 1] = '\0';
 }
 
+/*============================================================================
+ * ETHERNET ASYNC EVENTS (spec 302-330): +ETH:UP, +ETH:DOWN, +ETH:CLIENT, +ETH:CLIENT_LEAVE
+ * MT7628 single LAN port = PORT 1
+ *============================================================================*/
+#define ETH_PORT                1
+#define ETH_EVENT_CLIENTS_MAX   32
+
+static struct {
+    int  carrier;
+    char client_macs[ETH_EVENT_CLIENTS_MAX][18];
+    char client_ips[ETH_EVENT_CLIENTS_MAX][16];
+    int  client_count;
+} eth_event_prev;
+
+static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
+                                char macs[][18], char ips[][16], int *client_count) {
+    FILE *fp;
+    char line[256];
+
+    *carrier = 0;
+    if (ip_len) ip[0] = '\0';
+    *client_count = 0;
+
+    fp = fopen("/sys/class/net/eth0/carrier", "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) *carrier = atoi(line);
+        fclose(fp);
+    }
+
+    if (!*carrier) return;
+
+    fp = popen("ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1", "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\n")] = '\0';
+            strncpy(ip, line, ip_len - 1);
+            ip[ip_len - 1] = '\0';
+        }
+        drain_popen(fp);
+        pclose(fp);
+    }
+
+    fp = fopen("/tmp/dhcp.leases", "r");
+    if (!fp) return;
+    while (fgets(line, sizeof(line), fp) && *client_count < ETH_EVENT_CLIENTS_MAX) {
+        unsigned long ts;
+        char mac[32], cip[32], name[64];
+        if (sscanf(line, "%lu %31s %31s %63s", &ts, mac, cip, name) == 4) {
+            strncpy(macs[*client_count], mac, 17);
+            macs[*client_count][17] = '\0';
+            strncpy(ips[*client_count], cip, 15);
+            ips[*client_count][15] = '\0';
+            (*client_count)++;
+        }
+    }
+    fclose(fp);
+}
+
+static int eth_event_mac_in_list(const char *mac, char macs[][18], int count) {
+    int i;
+    for (i = 0; i < count; i++)
+        if (strcasecmp(mac, macs[i]) == 0) return 1;
+    return 0;
+}
+
+/****************************************************************
+* eth_events_poll - emits +ETH:UP, +ETH:DOWN, +ETH:CLIENT, +ETH:CLIENT_LEAVE
+****************************************************************/
+void eth_events_poll(uart_inst_t *uart) {
+    int carrier = 0, i;
+    char ip[32] = "";
+    char cur_macs[ETH_EVENT_CLIENTS_MAX][18];
+    char cur_ips[ETH_EVENT_CLIENTS_MAX][16];
+    int cur_count = 0;
+
+    eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
+
+    if (carrier && !eth_event_prev.carrier) {
+        send_event(uart, "+ETH:UP,%d,IP=%s", ETH_PORT, ip[0] ? ip : "0.0.0.0");
+    } else if (!carrier && eth_event_prev.carrier) {
+        send_event(uart, "+ETH:DOWN,%d", ETH_PORT);
+    }
+
+    if (carrier) {
+        for (i = 0; i < cur_count; i++) {
+            if (!eth_event_mac_in_list(cur_macs[i], eth_event_prev.client_macs, eth_event_prev.client_count)) {
+                send_event(uart, "+ETH:CLIENT,%d,%s,%s", ETH_PORT, cur_macs[i], cur_ips[i]);
+            }
+        }
+        for (i = 0; i < eth_event_prev.client_count; i++) {
+            if (!eth_event_mac_in_list(eth_event_prev.client_macs[i], cur_macs, cur_count)) {
+                send_event(uart, "+ETH:CLIENT_LEAVE,%d,%s", ETH_PORT, eth_event_prev.client_macs[i]);
+            }
+        }
+    }
+
+    eth_event_prev.carrier = carrier;
+    eth_event_prev.client_count = cur_count;
+    for (i = 0; i < cur_count; i++) {
+        strncpy(eth_event_prev.client_macs[i], cur_macs[i], 17);
+        eth_event_prev.client_macs[i][17] = '\0';
+        strncpy(eth_event_prev.client_ips[i], cur_ips[i], 15);
+        eth_event_prev.client_ips[i][15] = '\0';
+    }
+}
+
 /**
- * AT+ETH?
+ * AT+ETH? - Query Ethernet link status, IP, client count and list (spec 274-300)
+ * Response when DOWN: +ETH:DOWN then OK
+ * Response when UP:   +ETH:UP,IP=<ip>,CLIENTS=<n> then +ETH:CLIENT,<PORT>,<MAC>,<IP> per client then OK
+ * PORT = physical Ethernet port number (1-based); MT7628 single LAN = port 1
  */
 /****************************************************************
 * cmd_eth_query
@@ -1079,7 +1188,7 @@ static void cmd_factory(uart_inst_t *uart) {
 }
 
 /**
- * AT+SAVE - Save configuration
+ * AT+SAVE - Save configuration to non-volatile (spec 333-341). Response: OK or ERROR.
  */
 /****************************************************************
 * cmd_save

@@ -12,5 +12,8 @@ void atcmd_init(uart_inst_t *uart);
 /** Call from main loop to emit WiFi async events (APJOIN, APLEAVE, STACONN, STADISCONN). */
 void wifi_events_poll(uart_inst_t *uart);
 
+/** Call from main loop to emit Ethernet events (UP, DOWN, CLIENT, CLIENT_LEAVE). */
+void eth_events_poll(uart_inst_t *uart);
+
 #endif /* ATCMD_H */
 
