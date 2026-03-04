@@ -45,14 +45,15 @@ static void send_response(uart_inst_t *uart, const char *fmt, ...) {
 
 /** Drain popen stream before pclose to avoid "Broken pipe" from child. */
 static void drain_popen(FILE *fp) {
-    char buf[256];
+    char buf[256] = {0};
     if (fp) while (fgets(buf, sizeof(buf), fp)) {}
 }
 
 /** Parse dnsmasq lease line "timestamp mac ip hostname client_id"; return 1 if mac matches (case-insensitive) and copy ip. */
 static int lease_line_get_ip(const char *lease_line, const char *mac, char *ip_out, size_t ip_len) {
-    unsigned int ts;
-    char mac_buf[18], ip_buf[16];
+    unsigned int ts = 0;
+    char mac_buf[18] = {0};
+    char ip_buf[16] = {0};
     if (sscanf(lease_line, "%u %17s %15s", &ts, mac_buf, ip_buf) < 3)
         return 0;
     if (strcasecmp(mac_buf, mac) != 0)
@@ -535,8 +536,12 @@ static void cmd_wifimode_query(uart_inst_t *uart) {
 * cmd_wifiap_clients
 ****************************************************************/
 static void cmd_wifiap_clients(uart_inst_t *uart) {
-    FILE *fp;
-    char line[256];
+    FILE *fp = NULL;
+    FILE *leases = NULL;
+    char line[256] = {0};
+    char mac[18] = {0};
+    char ip[16] = "0.0.0.0";
+    char lease_line[256] = {0};
     int client_count = 0;
 
     fp = popen("iw dev phy0-ap0 station dump | grep Station | awk '{print $2}'", "r");
@@ -549,19 +554,17 @@ static void cmd_wifiap_clients(uart_inst_t *uart) {
         line[strcspn(line, "\n")] = 0;
 
         if (strlen(line) > 0) {
-            char mac[18];
             strncpy(mac, line, sizeof(mac) - 1);
             mac[sizeof(mac) - 1] = '\0';
-
-            char ip[16] = "0.0.0.0";
-            FILE *leases = fopen("/tmp/dhcp.leases", "r");
+            strcpy(ip, "0.0.0.0");
+            leases = fopen("/tmp/dhcp.leases", "r");
             if (leases) {
-                char lease_line[256];
                 while (fgets(lease_line, sizeof(lease_line), leases)) {
                     if (lease_line_get_ip(lease_line, mac, ip, sizeof(ip)))
                         break;
                 }
                 fclose(leases);
+                leases = NULL;
             }
 
             send_response(uart, "+WIFIAP:CLIENT,%s,%s", mac, ip);
@@ -746,9 +749,11 @@ static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
  * Writes name to sta_iface_out (max len bytes) and returns 1 if found, else 0.
  */
 static int get_sta_connected_iface(char *sta_iface_out, size_t len) {
-    FILE *fp;
-    char line[256];
-    char iface[32];
+    FILE *fp = NULL;
+    FILE *link = NULL;
+    char line[256] = {0};
+    char iface[32] = {0};
+    int connected = 0;
 
     if (!sta_iface_out || len < 2) return 0;
     sta_iface_out[0] = '\0';
@@ -760,15 +765,16 @@ static int get_sta_connected_iface(char *sta_iface_out, size_t len) {
         if (sscanf(line, "%31s", iface) != 1) continue;
         if (strcmp(iface, "phy0-ap0") == 0) continue; /* skip AP interface */
         snprintf(line, sizeof(line), "iw dev %s link 2>/dev/null", iface);
-        FILE *link = popen(line, "r");
+        link = popen(line, "r");
         if (!link) continue;
-        int connected = 0;
+        connected = 0;
         while (fgets(line, sizeof(line), link)) {
             if (strstr(line, "Not connected")) { connected = 0; break; }
             if (strstr(line, "Connected")) connected = 1;
         }
         drain_popen(link);
         pclose(link);
+        link = NULL;
         if (connected) {
             strncpy(sta_iface_out, iface, len - 1);
             sta_iface_out[len - 1] = '\0';
@@ -789,9 +795,13 @@ static int get_sta_connected_iface(char *sta_iface_out, size_t len) {
 * cmd_wifista_query
 ****************************************************************/
 static void cmd_wifista_query(uart_inst_t *uart) {
-    FILE *fp;
-    char line[256];
-    char sta_iface[32];
+    FILE *fp = NULL;
+    char line[256] = {0};
+    char sta_iface[32] = {0};
+    char ip[32] = "0.0.0.0";
+    char rssi[16] = "0";
+    char encryption[16] = "";
+    const char *sec_str = "OPEN";
 
     if (!get_sta_connected_iface(sta_iface, sizeof(sta_iface))) {
         send_response(uart, "+WIFISTA:DISCONNECTED,REASON=NOT_CONNECTED");
@@ -799,7 +809,6 @@ static void cmd_wifista_query(uart_inst_t *uart) {
         return;
     }
 
-    char ip[32] = "0.0.0.0";
     snprintf(line, sizeof(line), "ip -4 addr show %s 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1", sta_iface);
     fp = popen(line, "r");
     if (fp) {
@@ -812,9 +821,10 @@ static void cmd_wifista_query(uart_inst_t *uart) {
         }
         drain_popen(fp);
         pclose(fp);
+        fp = NULL;
     }
 
-    char rssi[16] = "0";
+    strcpy(rssi, "0");
     snprintf(line, sizeof(line), "iw dev %s link 2>/dev/null | awk '/signal:/ {print $2}'", sta_iface);
     fp = popen(line, "r");
     if (fp) {
@@ -827,10 +837,9 @@ static void cmd_wifista_query(uart_inst_t *uart) {
         }
         drain_popen(fp);
         pclose(fp);
+        fp = NULL;
     }
 
-    char encryption[16] = "";
-    const char *sec_str = "OPEN";
     if (uci_get_string("wireless", STA_IFACE_NAME, "encryption", encryption, sizeof(encryption)) != 0) {
         uci_get_string("wireless", "@wifi-iface[1]", "encryption", encryption, sizeof(encryption));
     }
@@ -860,8 +869,11 @@ static struct {
 } wifi_event_prev;
 
 static void wifi_event_get_ap_clients(char macs[][18], char ips[][16], int *count) {
-    FILE *fp;
-    char line[256];
+    FILE *fp = NULL;
+    FILE *leases = NULL;
+    char line[256] = {0};
+    char lease_line[256] = {0};
+
     *count = 0;
 
     fp = popen("iw dev phy0-ap0 station dump 2>/dev/null | grep Station | awk '{print $2}'", "r");
@@ -873,14 +885,14 @@ static void wifi_event_get_ap_clients(char macs[][18], char ips[][16], int *coun
         strncpy(macs[*count], line, 17);
         macs[*count][17] = '\0';
         strcpy(ips[*count], "0.0.0.0");
-        FILE *leases = fopen("/tmp/dhcp.leases", "r");
+        leases = fopen("/tmp/dhcp.leases", "r");
         if (leases) {
-            char lease_line[256];
             while (fgets(lease_line, sizeof(lease_line), leases)) {
                 if (lease_line_get_ip(lease_line, macs[*count], ips[*count], 16))
                     break;
             }
             fclose(leases);
+            leases = NULL;
         }
         (*count)++;
     }
@@ -889,9 +901,9 @@ static void wifi_event_get_ap_clients(char macs[][18], char ips[][16], int *coun
 }
 
 static int wifi_event_get_sta_state(char *ip, size_t ip_len, char *sec, size_t sec_len) {
-    FILE *fp;
-    char line[256];
-    char sta_iface[32];
+    FILE *fp = NULL;
+    char line[256] = {0};
+    char sta_iface[32] = {0};
 
     if (ip_len) ip[0] = '\0';
     if (sec_len) sec[0] = '\0';
@@ -926,7 +938,8 @@ static int wifi_event_get_sta_state(char *ip, size_t ip_len, char *sec, size_t s
 }
 
 static int wifi_event_mac_in_list(const char *mac, char macs[][18], int count) {
-    for (int i = 0; i < count; i++) {
+    int i = 0;
+    for (i = 0; i < count; i++) {
         if (strcasecmp(mac, macs[i]) == 0) return 1;
     }
     return 0;
@@ -934,8 +947,8 @@ static int wifi_event_mac_in_list(const char *mac, char macs[][18], int count) {
 
 /** Look up one MAC in /tmp/dhcp.leases; copy IP to ip_out if found. Returns 1 if IP set. */
 static int ap_client_lookup_ip(const char *mac, char *ip_out, size_t ip_len) {
-    FILE *fp;
-    char line[256];
+    FILE *fp = NULL;
+    char line[256] = {0};
     if (!ip_out || ip_len < 8) return 0;
     ip_out[0] = '\0';
     fp = fopen("/tmp/dhcp.leases", "r");
@@ -956,8 +969,10 @@ static int ap_client_lookup_ip(const char *mac, char *ip_out, size_t ip_len) {
 void wifi_events_poll(uart_inst_t *uart) {
     char cur_macs[WIFI_EVENT_AP_CLIENTS_MAX][18];
     char cur_ips[WIFI_EVENT_AP_CLIENTS_MAX][16];
-    int cur_ap = 0, i;
+    int cur_ap = 0;
     int cur_sta = 0;
+    int i = 0;
+    int retries = 0;
     char cur_sta_ip[32] = "";
     char cur_sta_sec[16] = "OPEN";
 
@@ -968,7 +983,7 @@ void wifi_events_poll(uart_inst_t *uart) {
     for (i = 0; i < cur_ap; i++) {
         if (!wifi_event_mac_in_list(cur_macs[i], wifi_event_prev.ap_macs, wifi_event_prev.ap_count)) {
             if (!cur_ips[i][0] || strcmp(cur_ips[i], "0.0.0.0") == 0) {
-                int retries = 3;
+                retries = 3;
                 while (retries-- > 0) {
                     sleep(1);
                     if (ap_client_lookup_ip(cur_macs[i], cur_ips[i], 16)) break;
@@ -1098,18 +1113,20 @@ static int eth_event_mac_in_list(const char *mac, char macs[][18], int count) {
 * eth_events_poll - emits +ETH:UP, +ETH:DOWN, +ETH:CLIENT, +ETH:CLIENT_LEAVE
 ****************************************************************/
 void eth_events_poll(uart_inst_t *uart) {
-    int carrier = 0, i;
+    int carrier = 0;
+    int i = 0;
+    int retries = 0;
+    int cur_count = 0;
     char ip[32] = "";
     char cur_macs[ETH_EVENT_CLIENTS_MAX][18];
     char cur_ips[ETH_EVENT_CLIENTS_MAX][16];
-    int cur_count = 0;
 
     eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
 
     if (carrier && !eth_event_prev.carrier) {
         /* Link just came up: if no IP yet, give DHCP time then re-read (e.g. on boot) */
         if (!ip[0] || strcmp(ip, "0.0.0.0") == 0) {
-            int retries = 5;   /* 5 x 1s = up to 5s for DHCP */
+            retries = 5;   /* 5 x 1s = up to 5s for DHCP */
             while (retries-- > 0) {
                 sleep(1);
                 eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
@@ -1153,17 +1170,33 @@ void eth_events_poll(uart_inst_t *uart) {
 /****************************************************************
 * cmd_eth_query
 ****************************************************************/
-static void cmd_eth_query(uart_inst_t *uart) {
-    FILE *fp=NULL;
-    char line[256]={0};
+typedef struct {
+    char mac[32];
+    char ip[32];
+} eth_client_t;
 
+static void cmd_eth_query(uart_inst_t *uart) {
+    FILE *fp = NULL;
+    char line[256] = {0};
+    char ip[32] = "0.0.0.0";
+    char mac[32] = {0};
+    char cip[32] = {0};
+    char name[64] = {0};
+    unsigned long ts = 0;
     int carrier = 0;
+    int client_count = 0;
+    int i = 0;
+    eth_client_t clients[64];
+
+    memset(clients, 0, sizeof(clients));
+
     fp = fopen("/sys/class/net/eth0/carrier", "r");
     if (fp) {
         if (fgets(line, sizeof(line), fp)) {
             carrier = atoi(line);
         }
         fclose(fp);
+        fp = NULL;
     }
 
     if (!carrier) {
@@ -1172,22 +1205,13 @@ static void cmd_eth_query(uart_inst_t *uart) {
         return;
     }
 
-    char ip[32] = "0.0.0.0";
     eth_get_lan_ip(ip, sizeof(ip));
-
-    typedef struct {
-        char mac[32];
-        char ip[32];
-    } eth_client_t;
-
-    eth_client_t clients[64];
-    int client_count = 0;
 
     fp = fopen("/tmp/dhcp.leases", "r");
     if (fp) {
         while (fgets(line, sizeof(line), fp) && client_count < 64) {
-            unsigned long ts;
-            char mac[32], cip[32], name[64];
+            ts = 0;
+            mac[0] = cip[0] = name[0] = '\0';
             if (sscanf(line, "%lu %31s %31s %63s",
                        &ts, mac, cip, name) == 4) {
                 strncpy(clients[client_count].mac, mac,
@@ -1200,11 +1224,12 @@ static void cmd_eth_query(uart_inst_t *uart) {
             }
         }
         fclose(fp);
+        fp = NULL;
     }
 
     send_response(uart, "+ETH:UP,IP=%s,CLIENTS=%d", ip, client_count);
 
-    for (int i = 0; i < client_count; i++) {
+    for (i = 0; i < client_count; i++) {
         send_response(uart, "+ETH:CLIENT,1,%s,%s",
                       clients[i].mac, clients[i].ip);
     }
