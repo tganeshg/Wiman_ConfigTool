@@ -298,15 +298,17 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
         return;
     }
 
-    /* Ensure wifinet0 exists when switching to AP (mode 2 or 3) */
-    if ((mode == 2 || mode == 3) &&
-        uci_get_string("wireless", AP_IFACE_NAME, "device", tmp, sizeof(tmp)) < 0) {
-        system("uci set wireless." AP_IFACE_NAME "=wifi-iface");
-        system("uci set wireless." AP_IFACE_NAME ".device='radio0'");
-        system("uci set wireless." AP_IFACE_NAME ".network='lan'");
-        system("uci set wireless." AP_IFACE_NAME ".mode='ap'");
-        system("uci set wireless." AP_IFACE_NAME ".disabled='0'");
-        system("uci commit wireless");
+    /* Ensure wifinet0 exists when switching to AP (mode 2 or 3); remove default_radio0 so wifinet0 gets phy0-ap0 */
+    if (mode == 2 || mode == 3) {
+        system("uci delete wireless.default_radio0 2>/dev/null");
+        if (uci_get_string("wireless", AP_IFACE_NAME, "device", tmp, sizeof(tmp)) < 0) {
+            system("uci set wireless." AP_IFACE_NAME "=wifi-iface");
+            system("uci set wireless." AP_IFACE_NAME ".device='radio0'");
+            system("uci set wireless." AP_IFACE_NAME ".network='lan'");
+            system("uci set wireless." AP_IFACE_NAME ".mode='ap'");
+            system("uci set wireless." AP_IFACE_NAME ".disabled='0'");
+            system("uci commit wireless");
+        }
     }
 
     fp = popen("uci get wireless." AP_IFACE_NAME ".disabled 2>/dev/null", "r");
@@ -324,6 +326,7 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
     }
 
     if (mode == 2) { /* AP only */
+        system("uci delete wireless.radio0.disabled 2>/dev/null");
         snprintf(command, sizeof(command),
             "uci set wireless." AP_IFACE_NAME ".mode='ap' 2>&1; "
             "uci set wireless." AP_IFACE_NAME ".disabled='0' 2>&1; "
@@ -929,6 +932,24 @@ static int wifi_event_mac_in_list(const char *mac, char macs[][18], int count) {
     return 0;
 }
 
+/** Look up one MAC in /tmp/dhcp.leases; copy IP to ip_out if found. Returns 1 if IP set. */
+static int ap_client_lookup_ip(const char *mac, char *ip_out, size_t ip_len) {
+    FILE *fp;
+    char line[256];
+    if (!ip_out || ip_len < 8) return 0;
+    ip_out[0] = '\0';
+    fp = fopen("/tmp/dhcp.leases", "r");
+    if (!fp) return 0;
+    while (fgets(line, sizeof(line), fp)) {
+        if (lease_line_get_ip(line, mac, ip_out, ip_len)) {
+            fclose(fp);
+            return 1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
 /****************************************************************
 * wifi_events_poll - call from main loop; emits +WIFI:APJOIN/APLEAVE/STACONN/STADISCONN
 ****************************************************************/
@@ -943,10 +964,17 @@ void wifi_events_poll(uart_inst_t *uart) {
     wifi_event_get_ap_clients(cur_macs, cur_ips, &cur_ap);
     cur_sta = wifi_event_get_sta_state(cur_sta_ip, sizeof(cur_sta_ip), cur_sta_sec, sizeof(cur_sta_sec));
 
-    /* APJOIN: in current, not in previous */
+    /* APJOIN: in current, not in previous; if IP still 0.0.0.0, give DHCP a moment and re-lookup */
     for (i = 0; i < cur_ap; i++) {
         if (!wifi_event_mac_in_list(cur_macs[i], wifi_event_prev.ap_macs, wifi_event_prev.ap_count)) {
-            send_event(uart, "+WIFI:APJOIN,%s,%s", cur_macs[i], cur_ips[i]);
+            if (!cur_ips[i][0] || strcmp(cur_ips[i], "0.0.0.0") == 0) {
+                int retries = 3;
+                while (retries-- > 0) {
+                    sleep(1);
+                    if (ap_client_lookup_ip(cur_macs[i], cur_ips[i], 16)) break;
+                }
+            }
+            send_event(uart, "+WIFI:APJOIN,%s,%s", cur_macs[i], cur_ips[i][0] ? cur_ips[i] : "0.0.0.0");
         }
     }
     /* APLEAVE: in previous, not in current */
@@ -996,10 +1024,10 @@ static struct {
 
 /** Get LAN IPv4: on OpenWrt the address is usually on br-lan (bridge), not eth0. Try br-lan then eth0. */
 static void eth_get_lan_ip(char *ip, size_t ip_len) {
-    FILE *fp;
-    char line[256];
+    FILE *fp=NULL;
+    char line[256]={0};
     const char *ifaces[] = { "br-lan", "eth0", NULL };
-    int i;
+    int i=0;
 
     if (ip_len) ip[0] = '\0';
     for (i = 0; ifaces[i]; i++) {
@@ -1024,8 +1052,12 @@ static void eth_get_lan_ip(char *ip, size_t ip_len) {
 
 static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
                                 char macs[][18], char ips[][16], int *client_count) {
-    FILE *fp;
-    char line[256];
+    FILE *fp=NULL;
+    char line[256]={0};
+    char mac[32]={0};
+    char cip[32]={0};
+    char name[64]={0};
+    unsigned long ts=0;
 
     *carrier = 0;
     if (ip_len) ip[0] = '\0';
@@ -1044,8 +1076,6 @@ static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
     fp = fopen("/tmp/dhcp.leases", "r");
     if (!fp) return;
     while (fgets(line, sizeof(line), fp) && *client_count < ETH_EVENT_CLIENTS_MAX) {
-        unsigned long ts;
-        char mac[32], cip[32], name[64];
         if (sscanf(line, "%lu %31s %31s %63s", &ts, mac, cip, name) == 4) {
             strncpy(macs[*client_count], mac, 17);
             macs[*client_count][17] = '\0';
@@ -1124,8 +1154,8 @@ void eth_events_poll(uart_inst_t *uart) {
 * cmd_eth_query
 ****************************************************************/
 static void cmd_eth_query(uart_inst_t *uart) {
-    FILE *fp;
-    char line[256];
+    FILE *fp=NULL;
+    char line[256]={0};
 
     int carrier = 0;
     fp = fopen("/sys/class/net/eth0/carrier", "r");
