@@ -994,6 +994,34 @@ static struct {
     int  client_count;
 } eth_event_prev;
 
+/** Get LAN IPv4: on OpenWrt the address is usually on br-lan (bridge), not eth0. Try br-lan then eth0. */
+static void eth_get_lan_ip(char *ip, size_t ip_len) {
+    FILE *fp;
+    char line[256];
+    const char *ifaces[] = { "br-lan", "eth0", NULL };
+    int i;
+
+    if (ip_len) ip[0] = '\0';
+    for (i = 0; ifaces[i]; i++) {
+        snprintf(line, sizeof(line), "ip -4 addr show %s 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1", ifaces[i]);
+        fp = popen(line, "r");
+        if (fp) {
+            if (fgets(line, sizeof(line), fp) && strlen(line) > 0) {
+                line[strcspn(line, "\n")] = '\0';
+                if (strlen(line) > 0) {
+                    strncpy(ip, line, ip_len - 1);
+                    ip[ip_len - 1] = '\0';
+                    drain_popen(fp);
+                    pclose(fp);
+                    return;
+                }
+            }
+            drain_popen(fp);
+            pclose(fp);
+        }
+    }
+}
+
 static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
                                 char macs[][18], char ips[][16], int *client_count) {
     FILE *fp;
@@ -1011,16 +1039,7 @@ static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
 
     if (!*carrier) return;
 
-    fp = popen("ip -4 addr show eth0 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1", "r");
-    if (fp) {
-        if (fgets(line, sizeof(line), fp)) {
-            line[strcspn(line, "\n")] = '\0';
-            strncpy(ip, line, ip_len - 1);
-            ip[ip_len - 1] = '\0';
-        }
-        drain_popen(fp);
-        pclose(fp);
-    }
+    eth_get_lan_ip(ip, ip_len);
 
     fp = fopen("/tmp/dhcp.leases", "r");
     if (!fp) return;
@@ -1058,6 +1077,15 @@ void eth_events_poll(uart_inst_t *uart) {
     eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
 
     if (carrier && !eth_event_prev.carrier) {
+        /* Link just came up: if no IP yet, give DHCP time then re-read (e.g. on boot) */
+        if (!ip[0] || strcmp(ip, "0.0.0.0") == 0) {
+            int retries = 5;   /* 5 x 1s = up to 5s for DHCP */
+            while (retries-- > 0) {
+                sleep(1);
+                eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
+                if (ip[0] && strcmp(ip, "0.0.0.0") != 0) break;
+            }
+        }
         send_event(uart, "+ETH:UP,%d,IP=%s", ETH_PORT, ip[0] ? ip : "0.0.0.0");
     } else if (!carrier && eth_event_prev.carrier) {
         send_event(uart, "+ETH:DOWN,%d", ETH_PORT);
@@ -1115,18 +1143,7 @@ static void cmd_eth_query(uart_inst_t *uart) {
     }
 
     char ip[32] = "0.0.0.0";
-    fp = popen("ip -4 addr show eth0 | awk '/inet /{print $2}' | cut -d/ -f1", "r");
-    if (fp) {
-        if (fgets(line, sizeof(line), fp)) {
-            line[strcspn(line, "\n")] = 0;
-            if (strlen(line) > 0) {
-                strncpy(ip, line, sizeof(ip) - 1);
-                ip[sizeof(ip) - 1] = '\0';
-            }
-        }
-        drain_popen(fp);
-        pclose(fp);
-    }
+    eth_get_lan_ip(ip, sizeof(ip));
 
     typedef struct {
         char mac[32];
