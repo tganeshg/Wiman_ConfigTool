@@ -1037,6 +1037,32 @@ static struct {
     int  client_count;
 } eth_event_prev;
 
+/** Fill reachable_macs with MACs currently in neighbour table (REACHABLE/STALE) on br-lan/eth0. */
+static void eth_get_reachable_macs(char reachable_macs[][18], int *count) {
+    FILE *fp = NULL;
+    char line[256] = {0};
+    const char *devs[] = { "br-lan", "eth0", NULL };
+    int d = 0;
+
+    *count = 0;
+    for (d = 0; devs[d] && *count < ETH_EVENT_CLIENTS_MAX; d++) {
+        snprintf(line, sizeof(line), "ip neigh show dev %s 2>/dev/null | awk '$NF==\"REACHABLE\" || $NF==\"STALE\" {print $(NF-1)}'", devs[d]);
+        fp = popen(line, "r");
+        if (!fp) continue;
+        while (*count < ETH_EVENT_CLIENTS_MAX && fgets(line, sizeof(line), fp)) {
+            line[strcspn(line, "\n")] = '\0';
+            if (strlen(line) >= 17) {
+                strncpy(reachable_macs[*count], line, 17);
+                reachable_macs[*count][17] = '\0';
+                (*count)++;
+            }
+        }
+        drain_popen(fp);
+        pclose(fp);
+        fp = NULL;
+    }
+}
+
 /** Get LAN IPv4: on OpenWrt the address is usually on br-lan (bridge), not eth0. Try br-lan then eth0. */
 static void eth_get_lan_ip(char *ip, size_t ip_len) {
     FILE *fp=NULL;
@@ -1067,12 +1093,15 @@ static void eth_get_lan_ip(char *ip, size_t ip_len) {
 
 static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
                                 char macs[][18], char ips[][16], int *client_count) {
-    FILE *fp=NULL;
-    char line[256]={0};
-    char mac[32]={0};
-    char cip[32]={0};
-    char name[64]={0};
-    unsigned long ts=0;
+    FILE *fp = NULL;
+    char line[256] = {0};
+    char mac[32] = {0};
+    char cip[32] = {0};
+    char name[64] = {0};
+    char reachable_macs[ETH_EVENT_CLIENTS_MAX][18];
+    int reachable_count = 0;
+    int i = 0;
+    unsigned long ts = 0;
 
     *carrier = 0;
     if (ip_len) ip[0] = '\0';
@@ -1082,24 +1111,33 @@ static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
     if (fp) {
         if (fgets(line, sizeof(line), fp)) *carrier = atoi(line);
         fclose(fp);
+        fp = NULL;
     }
 
     if (!*carrier) return;
 
     eth_get_lan_ip(ip, ip_len);
 
+    eth_get_reachable_macs(reachable_macs, &reachable_count);
+
     fp = fopen("/tmp/dhcp.leases", "r");
     if (!fp) return;
     while (fgets(line, sizeof(line), fp) && *client_count < ETH_EVENT_CLIENTS_MAX) {
         if (sscanf(line, "%lu %31s %31s %63s", &ts, mac, cip, name) == 4) {
-            strncpy(macs[*client_count], mac, 17);
-            macs[*client_count][17] = '\0';
-            strncpy(ips[*client_count], cip, 15);
-            ips[*client_count][15] = '\0';
-            (*client_count)++;
+            for (i = 0; i < reachable_count; i++) {
+                if (strcasecmp(mac, reachable_macs[i]) == 0) {
+                    strncpy(macs[*client_count], mac, 17);
+                    macs[*client_count][17] = '\0';
+                    strncpy(ips[*client_count], cip, 15);
+                    ips[*client_count][15] = '\0';
+                    (*client_count)++;
+                    break;
+                }
+            }
         }
     }
     fclose(fp);
+    fp = NULL;
 }
 
 static int eth_event_mac_in_list(const char *mac, char macs[][18], int count) {
@@ -1182,9 +1220,11 @@ static void cmd_eth_query(uart_inst_t *uart) {
     char mac[32] = {0};
     char cip[32] = {0};
     char name[64] = {0};
+    char reachable_macs[ETH_EVENT_CLIENTS_MAX][18];
     unsigned long ts = 0;
     int carrier = 0;
     int client_count = 0;
+    int reachable_count = 0;
     int i = 0;
     eth_client_t clients[64];
 
@@ -1206,6 +1246,7 @@ static void cmd_eth_query(uart_inst_t *uart) {
     }
 
     eth_get_lan_ip(ip, sizeof(ip));
+    eth_get_reachable_macs(reachable_macs, &reachable_count);
 
     fp = fopen("/tmp/dhcp.leases", "r");
     if (fp) {
@@ -1214,13 +1255,18 @@ static void cmd_eth_query(uart_inst_t *uart) {
             mac[0] = cip[0] = name[0] = '\0';
             if (sscanf(line, "%lu %31s %31s %63s",
                        &ts, mac, cip, name) == 4) {
-                strncpy(clients[client_count].mac, mac,
-                        sizeof(clients[client_count].mac) - 1);
-                clients[client_count].mac[sizeof(clients[client_count].mac) - 1] = '\0';
-                strncpy(clients[client_count].ip, cip,
-                        sizeof(clients[client_count].ip) - 1);
-                clients[client_count].ip[sizeof(clients[client_count].ip) - 1] = '\0';
-                client_count++;
+                for (i = 0; i < reachable_count; i++) {
+                    if (strcasecmp(mac, reachable_macs[i]) == 0) {
+                        strncpy(clients[client_count].mac, mac,
+                                sizeof(clients[client_count].mac) - 1);
+                        clients[client_count].mac[sizeof(clients[client_count].mac) - 1] = '\0';
+                        strncpy(clients[client_count].ip, cip,
+                                sizeof(clients[client_count].ip) - 1);
+                        clients[client_count].ip[sizeof(clients[client_count].ip) - 1] = '\0';
+                        client_count++;
+                        break;
+                    }
+                }
             }
         }
         fclose(fp);
