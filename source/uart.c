@@ -202,42 +202,53 @@ int uart_register_callback(uart_inst_t *uart, const char *pattern,
 * uart_process_events
 ****************************************************************/
 void uart_process_events(uart_inst_t *uart) {
+    char *p = NULL;
+    char *end = NULL;
+    char *next_nl = NULL;
+    char *next_cr = NULL;
+    char *newline = NULL;
+    size_t line_len = 0;
+    int i = 0;
+    ssize_t n = 0;
+
     if (!uart || uart->fd < 0) return;
 
-    ssize_t n = read(uart->fd, uart->rx_buffer + uart->rx_data_len,
-                     uart->rx_buffer_size - uart->rx_data_len);
+    n = read(uart->fd, uart->rx_buffer + uart->rx_data_len,
+             uart->rx_buffer_size - uart->rx_data_len);
     if (n > 0) {
         uart->rx_data_len += n;
 
-        char *p = (char*)uart->rx_buffer;
-        char *end = p + uart->rx_data_len;
+        p = (char*)uart->rx_buffer;
+        end = p + uart->rx_data_len;
 
         while (p < end) {
-            char *newline = memchr(p, '\n', end - p);
-            if (!newline) {
-                newline = memchr(p, '\r', end - p);
+            /* Line ends at first \r or \n (accept \n, \r, or \r\n); line content excludes terminator(s) */
+            next_nl = memchr(p, '\n', (size_t)(end - p));
+            next_cr = memchr(p, '\r', (size_t)(end - p));
+            newline = NULL;
+            if (next_nl && next_cr) {
+                newline = (next_cr < next_nl) ? next_cr : next_nl;
+            } else if (next_nl) {
+                newline = next_nl;
+            } else if (next_cr) {
+                newline = next_cr;
             }
-
             if (!newline) break;
 
-            size_t line_len = newline - p;
-
-            if (*newline == '\r' && (newline + 1) < end && *(newline + 1) == '\n') {
-                line_len = (newline + 1) - p;
-            }
+            line_len = (size_t)(newline - p);
 
             if (line_len < sizeof(uart->line_buffer)) {
                 memcpy(uart->line_buffer, p, line_len);
                 uart->line_buffer[line_len] = '\0';
 
-                for (int i = 0; i < uart->callback_count; i++) {
+                for (i = 0; i < uart->callback_count; i++) {
                     uart->callbacks[i].callback(uart, uart->line_buffer,
                                                 uart->callbacks[i].user_data);
                 }
             }
 
             p = newline + 1;
-            if (*(newline) == '\r' && p < end && *p == '\n') {
+            if (*newline == '\r' && p < end && *p == '\n') {
                 p++;
             }
         }
