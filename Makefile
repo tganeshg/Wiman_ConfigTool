@@ -1,11 +1,16 @@
 #For Openwrt - HLLink
 #Serial AT Command Config tool @ Febraury 2026#
 
+#BASE_PATH = ${HOME}/openwrt2
 # Cross compiler
-STAGING_DIR = /home/ganesh/Projects/Wiman/openwrt/staging_dir
+#STAGING_DIR = {BASE_PATH}/openwrt/staging_dir
 
-export PATH := ${STAGING_DIR}/toolchain-mipsel_24kc_gcc-14.3.0_musl/bin:$(PATH)
-export STAGING_DIR := ${STAGING_DIR}
+
+#export PATH="$HOME/openwrt2/openwrt/staging_dir/toolchain-mipsel_24kc_gcc-14.3.0_musl/bin:$PATH"
+#export STAGING_DIR="$HOME/openwrt2/openwrt/staging_dir"
+
+#export PATH := ${STAGING_DIR}/toolchain-mipsel_24kc_gcc-14.3.0_musl/bin:$(PATH)
+#export STAGING_DIR := ${STAGING_DIR}
 
 CC 		= mipsel-openwrt-linux-gcc
 CFLAGS	= -Wall -Wno-unused-variable -Wunused-but-set-variable -Wpointer-sign
