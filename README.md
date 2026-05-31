@@ -1,13 +1,22 @@
 # ConfigTool — MT7628N AT Command Daemon
 
-AT-command daemon for **MT7628N** (OpenWrt) that communicates over UART with an **STM32** master. Implements the STM32 ↔ MT7628 UART AT protocol for WiFi (AP/STA), Ethernet, reset, and configuration.
+AT-command daemon for **MT7628N** (OpenWrt) that communicates over UART with an **STM32** master.
+Implements the STM32 ↔ MT7628 UART AT protocol for WiFi AP/STA, Ethernet, reset, and configuration management.
 
-## Protocol
+- **Full protocol spec:** `others/stm32_to_mt7628_uart.txt`
+- **Architecture & design:** [`DESIGN.md`](DESIGN.md)
 
-- **ASCII** AT commands over UART; line ending **CRLF** (`\r\n`).
-- **STM32 = master**, MT7628 = slave; one command at a time.
-- Responses end with **OK** or **ERROR**; async events can be sent at any time.
-- Full specification: **`others/stm32_to_mt7628_uart.txt`**
+---
+
+## Protocol basics
+
+| Property | Value |
+|----------|-------|
+| Transport | UART `ttyS1`, 115200 8N1 |
+| Encoding | ASCII, line ending `\r\n` (CRLF) |
+| Master | STM32 — sends commands, waits for response |
+| Slave | MT7628N — executes, replies `OK` or `ERROR:N` |
+| Max line length | 255 characters (longer lines → `ERROR:6`) |
 
 After boot/reset the daemon sends **`+SYS:BOOT,READY`**; the STM32 must wait for this before sending commands.
 
@@ -15,105 +24,147 @@ After boot/reset the daemon sends **`+SYS:BOOT,READY`**; the STM32 must wait for
 
 ## Build (OpenWrt cross-compile)
 
-Requires OpenWrt staging/toolchain (see `Makefile` for `STAGING_DIR`).
+Requires an OpenWrt SDK/staging directory for mipsel.
 
 ```bash
+# Default — uses STAGING_DIR path set in Makefile
 make
+
+# Override SDK path on the command line
+make STAGING_DIR=/opt/openwrt/staging_dir
+
+# Override firmware version string
+make VERSION=1.3.0
+
+# Remove objects and binary
+make clean
 ```
 
-Output: **`bin/Sample`**. Copy to the device (e.g. `/usr/bin/` or your firmware path).
-
-```bash
-make clean   # remove objects and binary
-```
+Output binary: **`bin/Sample`**.  
+Copy to the target device (e.g. `/usr/bin/configtool`) and run it as a daemon on startup.
 
 ---
 
-## Implemented AT Commands
+## AT Command Reference
 
 ### Basic
-| Command    | Description        | Response / behavior        |
-|-----------|--------------------|----------------------------|
-| `AT`      | Check alive        | OK                         |
-| `AT+VER?` | Protocol version   | +VER:MT7628N-AT-1.2.0, OK  |
 
-### Reset & config
-| Command       | Description           | Response / behavior                    |
-|---------------|-----------------------|----------------------------------------|
-| `AT+RST`      | Software reset        | OK, then Linux reboot → +SYS:BOOT,READY |
-| `AT+FACTORY`  | Factory reset         | Clears WiFi config, reboot → +SYS:BOOT,READY |
-| `AT+SAVE`     | Save to flash         | OK (runs `uci commit`)                 |
+| Command | Description | Response |
+|---------|-------------|----------|
+| `AT` | Alive check | `OK` |
+| `AT+VER?` | Firmware version | `+VER:MT7628N-AT-1.2.0` then `OK` |
 
-### WiFi mode (0=OFF, 1=STA, 2=AP, 3=AP+STA)
-| Command            | Description        | Response / behavior                          |
-|--------------------|--------------------|----------------------------------------------|
-| `AT+WIFIMODE=<n>`  | Set mode           | OK; ensures wifinet0/wifinet1, network.wwan |
-| `AT+WIFIMODE?`     | Query mode         | +WIFIMODE:&lt;0\|1\|2\|3&gt;, OK             |
+### Reset & Persistence
 
-### WiFi AP (LUCI: named section `wifinet0`)
-| Command               | Description              | Response / behavior                    |
-|-----------------------|--------------------------|----------------------------------------|
-| `AT+WIFIAPCFG=SSID,PWD,SEC` | Set AP config      | OK (SEC: OPEN, WPA, WPA2, WPA_WPA2)   |
-| `AT+WIFIAPCFG?`       | Query AP config          | +WIFIAPCFG:SSID=…,SEC=…,CLIENTS=n, OK |
-| `AT+WIFIAP?`          | AP client list           | +WIFIAP:CLIENT,MAC,IP … OK             |
+| Command | Description | Response |
+|---------|-------------|----------|
+| `AT+RST` | Software reboot | `OK`, then Linux reboots → `+SYS:BOOT,READY` |
+| `AT+FACTORY` | Factory reset + reboot | `OK`, clears all config → `+SYS:BOOT,READY` |
+| `AT+SAVE` | Commit UCI config to flash | `OK` or `ERROR:2` |
 
-### WiFi STA (LUCI: named section `wifinet1`, network `wwan`)
-| Command                | Description          | Response / behavior                          |
-|------------------------|---------------------|----------------------------------------------|
-| `AT+WIFISTACFG=SSID,PWD,SEC` | Set STA config | OK; creates wifinet1/network.wwan if needed |
-| `AT+WIFISTACFG?`       | Query STA config     | +WIFISTACFG:SSID=…,SEC=…,PASSWORD=…, OK      |
-| `AT+WIFISTA=1` / `=0`  | Connect / disconnect | OK                                          |
-| `AT+WIFISTA?`          | STA status           | +WIFISTA:CONNECTED,IP=…,RSSI=…,SEC=… or DISCONNECTED, OK |
+### WiFi Mode
+
+Mode values: `0` = OFF, `1` = STA only, `2` = AP only, `3` = AP + STA
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `AT+WIFIMODE=<0-3>` | Set WiFi mode | `OK` or `ERROR:N` |
+| `AT+WIFIMODE?` | Query current mode | `+WIFIMODE:<0\|1\|2\|3>` then `OK` |
+
+### WiFi AP (UCI section `wifinet0`)
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `AT+WIFIAPCFG=<SSID>,<PWD>,<SEC>` | Set AP config | `OK` or `ERROR:N` |
+| `AT+WIFIAPCFG?` | Query AP config | `+WIFIAPCFG:SSID=…,SEC=…,CLIENTS=n` then `OK` |
+| `AT+WIFIAP?` | List connected clients | `+WIFIAP:CLIENT,<MAC>,<IP>` × n then `OK` |
+
+`SEC` values: `OPEN`, `WPA`, `WPA2`, `WPA_WPA2`  
+`SSID`: 1–32 printable ASCII characters  
+`PWD`: 8–63 printable ASCII characters (ignored for `OPEN`)
+
+### WiFi STA (UCI section `wifinet1`, network `wwan`)
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `AT+WIFISTACFG=<SSID>,<PWD>,<SEC>` | Set STA credentials | `OK` or `ERROR:N` |
+| `AT+WIFISTACFG?` | Query STA credentials | `+WIFISTACFG:SSID=…,SEC=…,PASSWORD=…` then `OK` |
+| `AT+WIFISTA=1` | Connect STA | `OK` |
+| `AT+WIFISTA=0` | Disconnect STA | `OK` |
+| `AT+WIFISTA?` | Query STA status | `+WIFISTA:CONNECTED,IP=…,RSSI=…,SEC=…` or `+WIFISTA:DISCONNECTED,REASON=NOT_CONNECTED` then `OK` |
 
 ### Ethernet
-| Command   | Description              | Response / behavior                                      |
-|-----------|--------------------------|----------------------------------------------------------|
-| `AT+ETH?` | Link, IP, client count   | +ETH:DOWN, OK or +ETH:UP,IP=…,CLIENTS=n + +ETH:CLIENT,1,MAC,IP … OK |
+
+| Command | Description | Response |
+|---------|-------------|----------|
+| `AT+ETH?` | Link status, IP, clients | `+ETH:DOWN` or `+ETH:UP,IP=…,CLIENTS=n` + `+ETH:CLIENT,1,<MAC>,<IP>` × n then `OK` |
 
 ---
 
-## Async events (unsolicited, sent when state changes)
+## Async Events (unsolicited)
 
-### WiFi
-| Event                    | When                         |
-|--------------------------|------------------------------|
-| `+WIFI:APJOIN,MAC,IP`    | Client joined AP             |
-| `+WIFI:APLEAVE,MAC`      | Client left AP               |
-| `+WIFI:STACONN,IP,SEC`   | STA connected (got IP)       |
-| `+WIFI:STADISCONN,REASON`| STA disconnected             |
+The daemon emits these at any time when state changes. No command needed.
 
-### Ethernet (PORT = 1 for single LAN)
-| Event                      | When                     |
-|----------------------------|--------------------------|
-| `+ETH:UP,1,IP=<ip>`        | Link up                  |
-| `+ETH:DOWN,1`              | Link down                |
-| `+ETH:CLIENT,1,MAC,IP`     | New client got IP         |
-| `+ETH:CLIENT_LEAVE,1,MAC`  | Client left              |
+### WiFi events
 
----
+| Event | Trigger |
+|-------|---------|
+| `+WIFI:APJOIN,<MAC>,<IP>` | Client joined the AP |
+| `+WIFI:APLEAVE,<MAC>` | Client left the AP |
+| `+WIFI:STACONN,<IP>,<SEC>` | STA connected and got IP |
+| `+WIFI:STADISCONN,NOT_CONNECTED` | STA disconnected |
 
-## Source layout
+> **Note:** `APJOIN` uses a non-blocking DHCP wait (up to ~3 poll ticks ≈ 3 s). If no lease
+> appears within that window the event is fired with `IP=0.0.0.0`.
 
-| Path            | Role                                      |
-|-----------------|-------------------------------------------|
-| `source/main.c` | Entry, UART init, select loop, event poll |
-| `source/atcmd.c`| All AT handlers, UCI, WiFi/ETH event poll |
-| `source/uart.c` | UART open/read/write, line callback       |
-| `include/*.h`   | atcmd.h, uart.h                           |
-| `others/stm32_to_mt7628_uart.txt` | Full protocol spec              |
+### Ethernet events (PORT = `1` for the single LAN port)
+
+| Event | Trigger |
+|-------|---------|
+| `+ETH:UP,1,IP=<ip>` | Ethernet link came up |
+| `+ETH:DOWN,1` | Ethernet link went down |
+| `+ETH:CLIENT,1,<MAC>,<IP>` | New LAN client appeared |
+| `+ETH:CLIENT_LEAVE,1,<MAC>` | LAN client disappeared |
+
+> **Note:** `+ETH:UP` uses a non-blocking DHCP wait (up to ~5 poll ticks ≈ 5 s).
 
 ---
 
-## Dependencies
+## Error Codes
 
-- OpenWrt toolchain (mipsel, musl); **libuci** (UCI), **libubox**.
-- Runtime: **eth0** for Ethernet; **phy0-ap0** (AP) and discovered STA interface for WiFi; **/tmp/dhcp.leases** for client lists.
+| Response | Meaning |
+|----------|---------|
+| `ERROR:1` | Invalid or out-of-range parameter |
+| `ERROR:2` | Command executed but system call / UCI returned an error |
+| `ERROR:6` | Input line too long (≥ 256 bytes) or unrecognised command |
+
+Full error code definitions: `others/stm32_to_mt7628_uart.txt`
 
 ---
 
-## Error responses
+## Source Layout
 
-- **ERROR** — generic failure  
-- **ERROR:1** — INVALID_PARAM (e.g. bad AT+WIFIAPCFG / AT+WIFISTACFG parameters)
+| Path | Role |
+|------|------|
+| `source/main.c` | Entry point, signal handling, `select()` event loop |
+| `source/atcmd.c` | All AT command handlers, UCI helpers, async event polling |
+| `source/uart.c` | UART open/configure/read/write, line extraction, callback dispatch |
+| `include/uart.h` | UART abstraction API |
+| `include/atcmd.h` | AT command public API (`atcmd_init`, poll functions) |
+| `others/stm32_to_mt7628_uart.txt` | Full protocol specification |
+| `DESIGN.md` | Architecture, data flow, state machine diagrams |
 
-Full error code list is in **`others/stm32_to_mt7628_uart.txt`**.
+---
+
+## Runtime Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| `libuci` | Read/write OpenWrt UCI wireless configuration |
+| `libubox` | OpenWrt utility library |
+| `iw` | AP station dump; STA link/signal query |
+| `ip neigh` | Ethernet ARP neighbour table |
+| `/tmp/dhcp.leases` | Map MAC addresses to DHCP-assigned IPs |
+| `/sys/class/net/eth0/carrier` | Ethernet link carrier state |
+| `wifi` (OpenWrt) | Apply wireless configuration changes |
+| `reboot` / `firstboot` | Software / factory reset |

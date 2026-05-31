@@ -49,7 +49,7 @@ struct uart_inst {
     size_t      line_len;
 
     struct {
-        char        pattern[64];
+        char        pattern[64]; /* reserved for future prefix-filtering; all callbacks currently fire on every line */
         uart_callback_t callback;
         void       *user_data;
     } callbacks[16];
@@ -58,6 +58,16 @@ struct uart_inst {
 
 /****************************************************************
 * uart_baud_to_const
+*
+* Converts an integer baud rate to the POSIX speed_t constant
+* required by cfsetispeed() / cfsetospeed().
+*
+* Parameters:
+*   baudrate  - Desired baud rate (e.g. 115200)
+*
+* Returns:
+*   Corresponding B* constant, or B0 if the rate is unsupported.
+*   Callers should treat B0 as an error.
 ****************************************************************/
 static speed_t uart_baud_to_const(int baudrate) {
     switch(baudrate) {
@@ -68,6 +78,24 @@ static speed_t uart_baud_to_const(int baudrate) {
 
 /****************************************************************
 * uart_parse_mode
+*
+* Parses a three-character serial-mode string (e.g. "8N1") into
+* the termios flag values needed by uart_open().
+*
+* Format: <data bits><parity><stop bits>
+*   Data bits : 5, 6, 7, or 8
+*   Parity    : N (none), E (even), O (odd)
+*   Stop bits : 1 or 2
+*
+* Parameters:
+*   mode       - Null-terminated mode string (exactly 3 characters)
+*   data_bits  - Output: CS5/CS6/CS7/CS8 flag
+*   parity     - Output: PARENB/PARODD flags (0 for none)
+*   stop_bits  - Output: CSTOPB flag (0 for 1 stop bit)
+*   iflags     - Output: IGNPAR or INPCK input flag
+*
+* Returns:
+*   0 on success, -1 if the mode string is invalid.
 ****************************************************************/
 static int uart_parse_mode(const char *mode, tcflag_t *data_bits, tcflag_t *parity,
                            tcflag_t *stop_bits, tcflag_t *iflags) {
@@ -109,6 +137,20 @@ static int uart_parse_mode(const char *mode, tcflag_t *data_bits, tcflag_t *pari
 
 /****************************************************************
 * uart_init
+*
+* Allocates and zero-initialises a uart_inst_t.  The port is NOT
+* opened here; call uart_configure() then uart_open() before use.
+*
+* Parameters:
+*   rx_buffer_size  - Size in bytes of the internal receive ring
+*                     buffer.  Must be > 0.  Recommended: 2048.
+*
+* Returns:
+*   Pointer to new uart_inst_t on success, NULL on allocation failure.
+*
+* Notes:
+*   The caller owns the returned pointer and must free it via
+*   uart_destroy() when done.
 ****************************************************************/
 uart_inst_t* uart_init(size_t rx_buffer_size) {
     uart_inst_t *uart = calloc(1, sizeof(uart_inst_t));
@@ -127,6 +169,21 @@ uart_inst_t* uart_init(size_t rx_buffer_size) {
 
 /****************************************************************
 * uart_configure
+*
+* Stores the device path, baud rate, and serial-mode settings in
+* the uart_inst_t.  The port is NOT opened; call uart_open() after
+* this function.
+*
+* Parameters:
+*   uart     - Initialised instance from uart_init()
+*   device   - Device name without "/dev/" prefix (e.g. "ttyS1")
+*   baudrate - Baud rate integer (e.g. 115200)
+*   mode     - Serial mode string, e.g. "8N1"
+*
+* Returns:
+*   0 on success.
+*   -1 if any argument is NULL, the baud rate is unsupported,
+*      or the mode string is invalid.
 ****************************************************************/
 int uart_configure(uart_inst_t *uart, const char *device, int baudrate, const char *mode) {
     if (!uart || !device || !mode) return -1;
@@ -142,6 +199,22 @@ int uart_configure(uart_inst_t *uart, const char *device, int baudrate, const ch
 
 /****************************************************************
 * uart_open
+*
+* Opens the tty device and applies the termios settings stored by
+* uart_configure().  Flushes any stale RX bytes before returning.
+*
+* Parameters:
+*   uart  - Configured instance; must not already be open (fd >= 0).
+*
+* Returns:
+*   0 on success.
+*   -1 if uart is NULL, already open, open(2) fails, or tcsetattr
+*      fails (fd is closed and reset to -1 before returning -1).
+*
+* Side effects:
+*   Sets uart->fd to the opened file descriptor.
+*   Applies O_RDWR | O_NOCTTY | O_NDELAY flags.
+*   Calls cfmakeraw() then applies data bits, parity, stop bits.
 ****************************************************************/
 int uart_open(uart_inst_t *uart) {
     if (!uart || uart->fd >= 0) return -1;
@@ -176,6 +249,18 @@ int uart_open(uart_inst_t *uart) {
 
 /****************************************************************
 * uart_write
+*
+* Writes raw bytes to the UART file descriptor.  This is a thin
+* wrapper around write(2) with no internal buffering or retries.
+*
+* Parameters:
+*   uart  - Open UART instance
+*   data  - Pointer to bytes to transmit
+*   len   - Number of bytes to write
+*
+* Returns:
+*   Number of bytes written (may be less than len on partial write),
+*   or -1 on error / if uart is not open.
 ****************************************************************/
 ssize_t uart_write(uart_inst_t *uart, const void *data, size_t len) {
     if (!uart || uart->fd < 0) return -1;
@@ -184,6 +269,23 @@ ssize_t uart_write(uart_inst_t *uart, const void *data, size_t len) {
 
 /****************************************************************
 * uart_register_callback
+*
+* Registers a function to be called each time a complete line is
+* received.  Up to 16 callbacks may be registered on one instance.
+*
+* Currently ALL registered callbacks are invoked for every line
+* regardless of the pattern argument — pattern is reserved for
+* future prefix-based filtering and should be passed as "".
+*
+* Parameters:
+*   uart       - Open or configured uart_inst_t
+*   pattern    - Reserved; pass "" (empty string)
+*   cb         - Callback: void cb(uart_inst_t*, const char* line, void*)
+*   user_data  - Opaque pointer forwarded to cb on each invocation
+*
+* Returns:
+*   0 on success, -1 if any argument is NULL or the callback table
+*   is full (limit: 16 entries).
 ****************************************************************/
 int uart_register_callback(uart_inst_t *uart, const char *pattern,
                            uart_callback_t cb, void *user_data) {
@@ -200,6 +302,29 @@ int uart_register_callback(uart_inst_t *uart, const char *pattern,
 
 /****************************************************************
 * uart_process_events
+*
+* Reads available bytes from the UART fd into the internal RX
+* buffer and dispatches every complete line to all registered
+* callbacks.
+*
+* Line termination: accepts \n, \r, or \r\n (CRLF preferred by
+* the AT protocol).  Line content delivered to callbacks is
+* null-terminated and excludes the terminator characters.
+*
+* Oversized lines (>= 256 bytes): instead of silently dropping,
+* writes "ERROR:6\r\n" directly to the UART so the master knows
+* its command was rejected.
+*
+* Buffer compaction: any unprocessed bytes left after the last
+* complete line are moved to the front of rx_buffer with memmove
+* so partial lines survive across multiple read() calls.
+*
+* Parameters:
+*   uart  - Open uart_inst_t; no-op if uart is NULL or fd < 0.
+*
+* Notes:
+*   Should be called after select()/poll() indicates the fd is
+*   readable.  Not re-entrant; designed for single-threaded use.
 ****************************************************************/
 void uart_process_events(uart_inst_t *uart) {
     char *p = NULL;
@@ -245,6 +370,9 @@ void uart_process_events(uart_inst_t *uart) {
                     uart->callbacks[i].callback(uart, uart->line_buffer,
                                                 uart->callbacks[i].user_data);
                 }
+            } else {
+                /* Line too long for buffer - reject with NOT_SUPPORTED error */
+                uart_write(uart, "ERROR:6\r\n", 9);
             }
 
             p = newline + 1;
@@ -264,6 +392,15 @@ void uart_process_events(uart_inst_t *uart) {
 
 /****************************************************************
 * uart_destroy
+*
+* Closes the UART file descriptor (if open) and frees all memory
+* associated with the uart_inst_t, including the RX buffer.
+*
+* Parameters:
+*   uart  - Instance to destroy; safe to call with NULL (no-op).
+*
+* Notes:
+*   After this call the pointer is invalid and must not be used.
 ****************************************************************/
 void uart_destroy(uart_inst_t *uart) {
     if (!uart) return;
@@ -274,6 +411,15 @@ void uart_destroy(uart_inst_t *uart) {
 
 /****************************************************************
 * uart_get_fd
+*
+* Returns the raw file descriptor for use in select() / poll()
+* by the main event loop.
+*
+* Parameters:
+*   uart  - Any initialised uart_inst_t (need not be open yet)
+*
+* Returns:
+*   The file descriptor (>= 0) if the port is open, -1 otherwise.
 ****************************************************************/
 int uart_get_fd(uart_inst_t *uart) {
     if (!uart) return -1;

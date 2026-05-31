@@ -42,6 +42,14 @@ static volatile int g_running = 1;
 
 /****************************************************************
 * sigint_handler
+*
+* POSIX signal handler for SIGINT and SIGTERM.
+* Sets the global g_running flag to 0 so the main select() loop
+* exits cleanly on the next iteration, allowing uart_destroy() to
+* run and the process to terminate gracefully.
+*
+* Parameters:
+*   sig  - Signal number (unused; suppressed with (void)sig)
 ****************************************************************/
 static void sigint_handler(int sig) {
     (void)sig;
@@ -49,7 +57,26 @@ static void sigint_handler(int sig) {
 }
 
 /****************************************************************
-* Main
+* main
+*
+* Daemon entry point.
+*
+* Sequence:
+*   1. Install SIGINT/SIGTERM handlers for clean shutdown.
+*   2. Allocate and configure the UART instance (ttyS1, 115200 8N1).
+*   3. Open the UART device and register the AT command callback
+*      via atcmd_init() — which also sends +SYS:BOOT,READY.
+*   4. Enter the select() event loop (1 s timeout):
+*        a. uart_process_events() — drains incoming bytes, dispatches
+*           complete lines to the AT command callback.
+*        b. wifi_events_poll()    — detects AP join/leave and STA
+*           connect/disconnect; sends unsolicited +WIFI:* events.
+*        c. eth_events_poll()     — detects Ethernet link changes and
+*           LAN client join/leave; sends unsolicited +ETH:* events.
+*   5. On shutdown signal: uart_destroy() and return 0.
+*
+* Returns:
+*   0 on clean exit, 1 on initialisation failure.
 ****************************************************************/
 int main(void) {
     signal(SIGINT, sigint_handler);

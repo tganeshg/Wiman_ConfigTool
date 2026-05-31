@@ -22,7 +22,21 @@
 #include <strings.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <ctype.h>
+#include <time.h>
 #include <uci.h>
+
+/****************************************************************
+* Firmware version
+****************************************************************/
+#define AT_VERSION "MT7628N-AT-1.2.0"
+
+/*============================================================================
+ * ERROR CODES (match protocol spec)
+ *============================================================================*/
+#define ERR_INVALID_PARAM   "ERROR:1"   /* Bad / out-of-range parameter        */
+#define ERR_CMD_FAILED      "ERROR:2"   /* Command executed but returned error  */
+#define ERR_NOT_SUPPORTED   "ERROR:6"   /* Oversized / unrecognised input       */
 
 #include "uart.h"
 #include "atcmd.h"
@@ -32,6 +46,15 @@
  *============================================================================*/
 /****************************************************************
 * send_response
+*
+* Formats and sends a solicited response line to the STM32 master.
+* Appends \r\n after the formatted string.  Used for all command
+* responses: "OK", "ERROR:N", "+CMD:data", etc.
+*
+* Parameters:
+*   uart  - Open UART instance to write to
+*   fmt   - printf-style format string
+*   ...   - Format arguments
 ****************************************************************/
 static void send_response(uart_inst_t *uart, const char *fmt, ...) {
     char buf[256] = {0};
@@ -43,10 +66,46 @@ static void send_response(uart_inst_t *uart, const char *fmt, ...) {
     uart_write(uart, "\r\n", 2);
 }
 
-/** Drain popen stream before pclose to avoid "Broken pipe" from child. */
+/****************************************************************
+* drain_popen
+*
+* Reads and discards all remaining output from a popen() FILE
+* before calling pclose().  Prevents SIGPIPE ("Broken pipe") in
+* the child process if we stopped reading early.
+*
+* Parameters:
+*   fp  - FILE* returned by popen(); safe to call with NULL.
+****************************************************************/
 static void drain_popen(FILE *fp) {
     char buf[256] = {0};
     if (fp) while (fgets(buf, sizeof(buf), fp)) {}
+}
+
+/****************************************************************
+* validate_wifi_string
+*
+* Validates that every character in a string is printable ASCII
+* (0x20 space through 0x7E tilde).  Rejects empty strings, NUL
+* pointers, and any byte with a control character or high bit set.
+*
+* Used to sanitise SSIDs and WPA passwords received over the UART
+* AT interface before they are passed to the UCI configuration API.
+*
+* Parameters:
+*   s  - Null-terminated string to validate
+*
+* Returns:
+*   1 if the string is non-empty and all characters are printable
+*   ASCII, 0 otherwise.
+****************************************************************/
+static int validate_wifi_string(const char *s) {
+    if (!s || s[0] == '\0') return 0;
+    while (*s) {
+        unsigned char c = (unsigned char)*s;
+        if (c < 0x20 || c > 0x7E) return 0;
+        s++;
+    }
+    return 1;
 }
 
 /** Parse dnsmasq lease line "timestamp mac ip hostname client_id"; return 1 if mac matches (case-insensitive) and copy ip. */
@@ -64,7 +123,19 @@ static int lease_line_get_ip(const char *lease_line, const char *mac, char *ip_o
 }
 
 /****************************************************************
-* send_event - unsolicited event to STM32 (no OK line)
+* send_event
+*
+* Formats and sends an unsolicited (async) event line to the
+* STM32 master.  Events are not paired with a command so no "OK"
+* line follows.  Appends \r\n after the formatted string.
+*
+* Examples: "+WIFI:APJOIN,aa:bb:cc:dd:ee:ff,192.168.1.10"
+*           "+ETH:UP,1,IP=192.168.1.1"
+*
+* Parameters:
+*   uart  - Open UART instance to write to
+*   fmt   - printf-style format string
+*   ...   - Format arguments
 ****************************************************************/
 static void send_event(uart_inst_t *uart, const char *fmt, ...) {
     char buf[256] = {0};
@@ -81,6 +152,23 @@ static void send_event(uart_inst_t *uart, const char *fmt, ...) {
  *============================================================================*/
 /****************************************************************
 * uci_get_string
+*
+* Reads a single UCI string option using the UCI C library API.
+* Allocates a fresh UCI context per call (no global context state).
+*
+* Parameters:
+*   pkg      - UCI package name (e.g. "wireless", "network")
+*   section  - UCI section name or anonymous index (e.g. "wifinet0",
+*              "@wifi-iface[0]")
+*   option   - Option name (e.g. "ssid", "disabled")
+*   out      - Output buffer to receive the value string
+*   out_len  - Size of output buffer in bytes
+*
+* Returns:
+*   0 on success with out filled (null-terminated, truncated to
+*   out_len-1 if necessary).
+*   -1 if the package/section/option is not found or any UCI
+*   operation fails.
 ****************************************************************/
 static int uci_get_string(const char *pkg, const char *section, const char *option,
                           char *out, size_t out_len) {
@@ -108,6 +196,26 @@ static int uci_get_string(const char *pkg, const char *section, const char *opti
 
 /****************************************************************
 * uci_set_string
+*
+* Writes a single UCI string option and commits the change to disk
+* using the UCI C library API.  User-supplied values (e.g. SSID,
+* password) are passed directly to the UCI library — NOT through
+* a shell — so no shell-injection escaping is needed here.
+*
+* Parameters:
+*   pkg      - UCI package name (e.g. "wireless")
+*   section  - UCI section name (e.g. "wifinet0")
+*   option   - Option name (e.g. "ssid")
+*   value    - Value string to set
+*
+* Returns:
+*   0 on success (option written and committed).
+*   -1 if uci_lookup_ptr, uci_set, or uci_commit fail.
+*
+* Notes:
+*   Each call allocates and frees its own UCI context.
+*   uci_commit is called with a NULL file argument so the change
+*   is written to the default UCI config directory.
 ****************************************************************/
 static int uci_set_string(const char *pkg, const char *section, const char *option,
                           const char *value) {
@@ -145,9 +253,28 @@ static int uci_set_string(const char *pkg, const char *section, const char *opti
 #define AP_IFACE_NAME "wifinet0"
 #define STA_IFACE_NAME "wifinet1"
 
-/**
- * AT+WIFIAPCFG=<SSID>,<PASSWORD>,<SECURITY>
- */
+/****************************************************************
+* cmd_wifiapcfg_set
+*
+* Handles: AT+WIFIAPCFG=<SSID>,<PASSWORD>,<SECURITY>
+*
+* Configures the Access Point interface (UCI section wifinet0).
+* Creates the section if it does not yet exist.
+* Applies the configuration and restarts the radio with `wifi`.
+*
+* Parameters:
+*   uart    - UART instance for sending the response
+*   params  - Pointer to the substring after "AT+WIFIAPCFG="
+*             Expected format: "SSID,PASSWORD,SECURITY"
+*
+* Validation:
+*   SSID     : 1–32 printable ASCII characters
+*   PASSWORD : 8–63 printable ASCII characters (WPA/WPA2 only)
+*   SECURITY : OPEN | WPA | WPA2 | WPA_WPA2
+*
+* Response:
+*   OK on success; ERROR:1 on invalid params; ERROR:2 on UCI failure.
+****************************************************************/
 static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
     char ssid[33] = "";
     char password[64] = "";
@@ -167,8 +294,8 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
     password[strcspn(password, "\r\n")] = '\0';
     security[strcspn(security, "\r\n")] = '\0';
 
-    if (strlen(ssid) < 1 || strlen(ssid) > 32) {
-        send_response(uart, "ERROR:1");
+    if (strlen(ssid) < 1 || strlen(ssid) > 32 || !validate_wifi_string(ssid)) {
+        send_response(uart, ERR_INVALID_PARAM);
         return;
     }
 
@@ -177,24 +304,24 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
         encryption = "none";
     } else if (strcmp(security, "WPA") == 0) {
         encryption = "psk";
-        if (strlen(password) < 8 || strlen(password) > 63) {
-            send_response(uart, "ERROR:1");
+        if (strlen(password) < 8 || strlen(password) > 63 || !validate_wifi_string(password)) {
+            send_response(uart, ERR_INVALID_PARAM);
             return;
         }
     } else if (strcmp(security, "WPA2") == 0) {
         encryption = "psk2";
-        if (strlen(password) < 8 || strlen(password) > 63) {
-            send_response(uart, "ERROR:1");
+        if (strlen(password) < 8 || strlen(password) > 63 || !validate_wifi_string(password)) {
+            send_response(uart, ERR_INVALID_PARAM);
             return;
         }
     } else if (strcmp(security, "WPA_WPA2") == 0) {
         encryption = "psk-mixed";
-        if (strlen(password) < 8 || strlen(password) > 63) {
-            send_response(uart, "ERROR:1");
+        if (strlen(password) < 8 || strlen(password) > 63 || !validate_wifi_string(password)) {
+            send_response(uart, ERR_INVALID_PARAM);
             return;
         }
     } else {
-        send_response(uart, "ERROR:1");
+        send_response(uart, ERR_INVALID_PARAM);
         return;
     }
 
@@ -209,24 +336,24 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
     }
 
     if (uci_set_string("wireless", AP_IFACE_NAME, "mode", "ap") < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (uci_set_string("wireless", AP_IFACE_NAME, "network", "lan") < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (uci_set_string("wireless", AP_IFACE_NAME, "ssid", ssid) < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (uci_set_string("wireless", AP_IFACE_NAME, "encryption", encryption) < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (strcmp(security, "OPEN") != 0) {
         if (uci_set_string("wireless", AP_IFACE_NAME, "key", password) < 0) {
-            send_response(uart, "ERROR");
+            send_response(uart, ERR_CMD_FAILED);
             return;
         }
     }
@@ -240,11 +367,20 @@ static void cmd_wifiapcfg_set(uart_inst_t *uart, const char *params) {
 
 /****************************************************************
 * cmd_wifiapcfg_query
+*
+* Handles: AT+WIFIAPCFG?
+*
+* Reads the current AP configuration from UCI (prefers wifinet0,
+* falls back to @wifi-iface[0]) and counts connected stations
+* via `iw dev phy0-ap0 station dump`.
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Response:
+*   +WIFIAPCFG:SSID=<ssid>,SEC=<OPEN|WPA|WPA2|WPA_WPA2>,CLIENTS=<n>
+*   OK
 ****************************************************************/
-/**
- * AT+WIFIAPCFG? - Query AP configuration
- * Response: +WIFIAPCFG:SSID=<ssid>,SEC=<sec>,CLIENTS=<n>
- */
 static void cmd_wifiapcfg_query(uart_inst_t *uart) {
     char ssid[33] = "";
     char encryption[16] = "";
@@ -281,21 +417,37 @@ static void cmd_wifiapcfg_query(uart_inst_t *uart) {
 
 /****************************************************************
 * cmd_wifimode_set
+*
+* Handles: AT+WIFIMODE=<0|1|2|3>
+*
+* Switches the WiFi radio operating mode:
+*   0 = OFF    — disables both wifinet0 and wifinet1
+*   1 = STA    — disables AP (wifinet0), enables STA (wifinet1),
+*                creates network.wwan if needed, restarts network
+*   2 = AP     — enables AP (wifinet0), disables STA (wifinet1)
+*   3 = AP+STA — enables both wifinet0 and wifinet1
+*
+* UCI section wifinet0 / wifinet1 are created if they do not exist.
+* For STA modes, existing SSID/password/encryption values in the STA
+* section are preserved; only device/mode/network/disabled are set.
+*
+* Parameters:
+*   uart   - UART instance for sending the response
+*   param  - Pointer to the mode digit string after "AT+WIFIMODE="
+*
+* Response:
+*   OK on success; ERROR:1 on invalid mode; ERROR:2 on shell failure.
 ****************************************************************/
-/**
- * AT+WIFIMODE=<mode>
- * mode: 0=OFF, 1=STA, 2=AP, 3=AP+STA
- */
 static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
-    int mode = atoi(param);
+    int mode = -1;
     char command[512] = {0};
     char buffer[256] = {0};
     char tmp[8] = {0};
     FILE *fp = NULL;
     int ret = 0;
 
-    if (mode < 0 || mode > 3) {
-        send_response(uart, "ERROR: Invalid mode");
+    if (sscanf(param, "%d", &mode) != 1 || mode < 0 || mode > 3) {
+        send_response(uart, ERR_INVALID_PARAM);
         return;
     }
 
@@ -410,7 +562,7 @@ static void cmd_wifimode_set(uart_inst_t *uart, const char *param) {
 
     fp = popen(command, "r");
     if (!fp) {
-        send_response(uart, "ERROR: Failed to execute command");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
 
@@ -443,16 +595,29 @@ send_wifimode_result:
     if (ret == 0) {
         send_response(uart, "OK");
     } else {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
     }
 }
 
-/**
- * AT+WIFIMODE? - Query current WiFi mode
- * Response: +WIFIMODE:<0|1|2|3>
- */
 /****************************************************************
 * cmd_wifimode_query
+*
+* Handles: AT+WIFIMODE?
+*
+* Reads the disabled/mode flags for wifinet0 (AP) and wifinet1
+* (STA) from UCI and maps them to a single mode number:
+*   0 = both disabled, 1 = STA only, 2 = AP only, 3 = AP+STA
+*
+* Falls back to @wifi-iface[0] / @wifi-iface[1] if the named
+* sections are not found.  If the "disabled" option is absent the
+* interface is treated as enabled (OpenWrt convention).
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Response:
+*   +WIFIMODE:<0|1|2|3>
+*   OK
 ****************************************************************/
 static void cmd_wifimode_query(uart_inst_t *uart) {
     char mode0[8] = "";
@@ -528,12 +693,23 @@ static void cmd_wifimode_query(uart_inst_t *uart) {
     send_response(uart, "OK");
 }
 
-/**
- * AT+WIFIAP? - Get detailed list of connected clients
- * Response: +WIFIAP:CLIENT,<MAC>,<IP> for each client, then OK
- */
 /****************************************************************
 * cmd_wifiap_clients
+*
+* Handles: AT+WIFIAP?
+*
+* Enumerates all stations currently associated with the AP
+* interface (phy0-ap0) using `iw dev phy0-ap0 station dump`.
+* For each MAC, looks up the DHCP-assigned IP in /tmp/dhcp.leases.
+* Reports "0.0.0.0" if no lease is found.
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Response:
+*   +WIFIAP:CLIENT,<MAC>,<IP>   (one line per connected client)
+*   OK
+*   (Just OK if no clients are connected or iw fails)
 ****************************************************************/
 static void cmd_wifiap_clients(uart_inst_t *uart) {
     FILE *fp = NULL;
@@ -576,14 +752,28 @@ static void cmd_wifiap_clients(uart_inst_t *uart) {
     send_response(uart, "OK");
 }
 
-/**
- * AT+WIFISTACFG=<SSID>,<PASSWORD>,<SECURITY>
- * SSID      : 1 to 32 characters
- * PASSWORD  : 8 to 63 characters (ignored if OPEN)
- * SECURITY  : OPEN | WPA | WPA2 | WPA_WPA2
- */
 /****************************************************************
 * cmd_wifista_cfg
+*
+* Handles: AT+WIFISTACFG=<SSID>,<PASSWORD>,<SECURITY>
+*
+* Stores STA credentials in UCI section wifinet1 (network wwan).
+* Creates wifinet1 and network.wwan if they do not exist.
+* Does NOT trigger a wifi restart — call AT+WIFISTA=1 or
+* AT+WIFIMODE=1/3 to apply.
+*
+* Parameters:
+*   uart    - UART instance for sending the response
+*   params  - Pointer to the substring after "AT+WIFISTACFG="
+*             Expected format: "SSID,PASSWORD,SECURITY"
+*
+* Validation:
+*   SSID     : 1–32 printable ASCII characters
+*   PASSWORD : 8–63 printable ASCII characters (WPA/WPA2 only)
+*   SECURITY : OPEN | WPA | WPA2 | WPA_WPA2
+*
+* Response:
+*   OK on success; ERROR:1 on invalid params; ERROR:2 on UCI failure.
 ****************************************************************/
 static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
     char ssid[33] = "";
@@ -599,8 +789,8 @@ static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
         return;
     }
 
-    if (strlen(ssid) < 1 || strlen(ssid) > 32) {
-        send_response(uart, "ERROR:1");
+    if (strlen(ssid) < 1 || strlen(ssid) > 32 || !validate_wifi_string(ssid)) {
+        send_response(uart, ERR_INVALID_PARAM);
         return;
     }
 
@@ -609,24 +799,24 @@ static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
         encryption = "none";
     } else if (strcmp(security, "WPA") == 0) {
         encryption = "psk";
-        if (strlen(password) < 8 || strlen(password) > 63) {
-            send_response(uart, "ERROR:1");
+        if (strlen(password) < 8 || strlen(password) > 63 || !validate_wifi_string(password)) {
+            send_response(uart, ERR_INVALID_PARAM);
             return;
         }
     } else if (strcmp(security, "WPA2") == 0) {
         encryption = "psk2";
-        if (strlen(password) < 8 || strlen(password) > 63) {
-            send_response(uart, "ERROR:1");
+        if (strlen(password) < 8 || strlen(password) > 63 || !validate_wifi_string(password)) {
+            send_response(uart, ERR_INVALID_PARAM);
             return;
         }
     } else if (strcmp(security, "WPA_WPA2") == 0) {
         encryption = "psk-mixed";
-        if (strlen(password) < 8 || strlen(password) > 63) {
-            send_response(uart, "ERROR:1");
+        if (strlen(password) < 8 || strlen(password) > 63 || !validate_wifi_string(password)) {
+            send_response(uart, ERR_INVALID_PARAM);
             return;
         }
     } else {
-        send_response(uart, "ERROR:1");
+        send_response(uart, ERR_INVALID_PARAM);
         return;
     }
 
@@ -644,20 +834,20 @@ static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
     sta_section = STA_IFACE_NAME;
 
     if (uci_set_string("wireless", sta_section, "mode", "sta") < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (uci_set_string("wireless", sta_section, "ssid", ssid) < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (uci_set_string("wireless", sta_section, "encryption", encryption) < 0) {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
         return;
     }
     if (strcmp(security, "OPEN") != 0) {
         if (uci_set_string("wireless", sta_section, "key", password) < 0) {
-            send_response(uart, "ERROR");
+            send_response(uart, ERR_CMD_FAILED);
             return;
         }
     }
@@ -666,12 +856,21 @@ static void cmd_wifista_cfg(uart_inst_t *uart, const char *params) {
     send_response(uart, "OK");
 }
 
-/**
- * AT+WIFISTACFG? - Query STA configuration
- * Response: +WIFISTACFG:SSID=<ssid>,SEC=<OPEN|WPA|WPA2|WPA_WPA2>,PASSWORD=<password>
- */
 /****************************************************************
 * cmd_wifistacfg_query
+*
+* Handles: AT+WIFISTACFG?
+*
+* Reads the stored STA credentials from UCI.  Prefers wifinet1;
+* falls back to @wifi-iface[1] then @wifi-iface[0].
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Response:
+*   +WIFISTACFG:SSID=<ssid>,SEC=<OPEN|WPA|WPA2|WPA_WPA2>,PASSWORD=<password>
+*   OK
+*   (PASSWORD is empty for OPEN networks)
 ****************************************************************/
 static void cmd_wifistacfg_query(uart_inst_t *uart) {
     char ssid[33] = "";
@@ -707,18 +906,33 @@ static void cmd_wifistacfg_query(uart_inst_t *uart) {
     send_response(uart, "OK");
 }
 
-/**
- * AT+WIFISTA=1   Connect STA
- * AT+WIFISTA=0   Disconnect STA
- */
 /****************************************************************
 * cmd_wifista_set
+*
+* Handles: AT+WIFISTA=<1|0>
+*
+* Enables (1) or disables (0) the STA interface by setting the
+* UCI "disabled" flag on wifinet1 (or @wifi-iface[1] as fallback),
+* committing the change, and running `wifi` to apply it.
+*
+* Parameters:
+*   uart   - UART instance for sending the response
+*   param  - Pointer to the digit string after "AT+WIFISTA="
+*            Must be exactly "0" or "1".
+*
+* Response:
+*   OK on success; ERROR:1 if param is not 0 or 1; ERROR:2 on failure.
 ****************************************************************/
 static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
-    int enable = atoi(param);
+    int enable = -1;
     char cmd[320];
     char tmp[8] = "";
     const char *sta = STA_IFACE_NAME;
+
+    if (sscanf(param, "%d", &enable) != 1 || (enable != 0 && enable != 1)) {
+        send_response(uart, ERR_INVALID_PARAM);
+        return;
+    }
 
     if (uci_get_string("wireless", sta, "device", tmp, sizeof(tmp)) < 0) {
         sta = "@wifi-iface[1]";
@@ -727,27 +941,38 @@ static void cmd_wifista_set(uart_inst_t *uart, const char *param) {
         snprintf(cmd, sizeof(cmd),
                  "uci set wireless.%s.disabled='0'; "
                  "uci commit wireless; wifi >/dev/null 2>&1", sta);
-    } else if (enable == 0) {
+    } else { /* enable == 0 */
         snprintf(cmd, sizeof(cmd),
                  "uci set wireless.%s.disabled='1'; "
                  "uci commit wireless; wifi >/dev/null 2>&1", sta);
-    } else {
-        send_response(uart, "ERROR:1");
-        return;
     }
 
     int ret = system(cmd);
     if (ret == 0) {
         send_response(uart, "OK");
     } else {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
     }
 }
 
-/**
- * Discover STA interface: first interface (other than AP iface) that shows "Connected" in iw link.
- * Writes name to sta_iface_out (max len bytes) and returns 1 if found, else 0.
- */
+/****************************************************************
+* get_sta_connected_iface
+*
+* Discovers the active STA wireless interface by iterating all
+* interfaces reported by `iw dev` and checking each one (except
+* the AP interface phy0-ap0) with `iw dev <iface> link`.
+*
+* The first interface that reports "Connected" (and not
+* "Not connected") is returned.
+*
+* Parameters:
+*   sta_iface_out  - Buffer to receive the interface name (e.g. "wlan0")
+*   len            - Size of sta_iface_out; must be >= 2
+*
+* Returns:
+*   1 if a connected STA interface was found (sta_iface_out filled),
+*   0 if no connected STA interface exists or len < 2.
+****************************************************************/
 static int get_sta_connected_iface(char *sta_iface_out, size_t len) {
     FILE *fp = NULL;
     FILE *link = NULL;
@@ -788,11 +1013,26 @@ static int get_sta_connected_iface(char *sta_iface_out, size_t len) {
     return 0;
 }
 
-/**
- * AT+WIFISTA? - Query STA connection status
- */
 /****************************************************************
 * cmd_wifista_query
+*
+* Handles: AT+WIFISTA?
+*
+* Reports the current STA connection state by:
+*   1. Finding the active STA interface via get_sta_connected_iface().
+*   2. Reading its IPv4 address via `ip -4 addr show`.
+*   3. Reading signal strength (RSSI) via `iw dev <iface> link`.
+*   4. Reading the encryption type from UCI.
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Response (connected):
+*   +WIFISTA:CONNECTED,IP=<ip>,RSSI=<dBm>,SEC=<OPEN|WPA|WPA2|WPA_WPA2>
+*   OK
+* Response (not connected):
+*   +WIFISTA:DISCONNECTED,REASON=NOT_CONNECTED
+*   OK
 ****************************************************************/
 static void cmd_wifista_query(uart_inst_t *uart) {
     FILE *fp = NULL;
@@ -868,6 +1108,23 @@ static struct {
     char sta_sec[16];
 } wifi_event_prev;
 
+/****************************************************************
+* wifi_event_get_ap_clients
+*
+* Builds the current list of MAC addresses associated with the AP
+* (phy0-ap0) and their DHCP-assigned IPs from /tmp/dhcp.leases.
+*
+* Parameters:
+*   macs   - Output 2-D array; each entry is a 17-char MAC string
+*            (e.g. "aa:bb:cc:dd:ee:ff") + null terminator
+*   ips    - Output 2-D array; each entry is up to 15-char IPv4
+*            string + null terminator; "0.0.0.0" if no lease found
+*   count  - Output: number of entries filled in macs[] and ips[]
+*
+* Notes:
+*   Silently returns count=0 if `iw dev phy0-ap0 station dump` fails.
+*   Caller must size macs and ips to at least WIFI_EVENT_AP_CLIENTS_MAX.
+****************************************************************/
 static void wifi_event_get_ap_clients(char macs[][18], char ips[][16], int *count) {
     FILE *fp = NULL;
     FILE *leases = NULL;
@@ -900,6 +1157,22 @@ static void wifi_event_get_ap_clients(char macs[][18], char ips[][16], int *coun
     pclose(fp);
 }
 
+/****************************************************************
+* wifi_event_get_sta_state
+*
+* Determines whether the STA is currently connected and, if so,
+* retrieves its IP address and security type.
+*
+* Parameters:
+*   ip       - Output buffer for IPv4 address string (or empty "")
+*   ip_len   - Size of ip buffer
+*   sec      - Output buffer for security string (OPEN/WPA/WPA2/WPA_WPA2)
+*   sec_len  - Size of sec buffer
+*
+* Returns:
+*   1 if STA is connected (ip and sec filled),
+*   0 if no connected STA interface is found.
+****************************************************************/
 static int wifi_event_get_sta_state(char *ip, size_t ip_len, char *sec, size_t sec_len) {
     FILE *fp = NULL;
     char line[256] = {0};
@@ -937,6 +1210,19 @@ static int wifi_event_get_sta_state(char *ip, size_t ip_len, char *sec, size_t s
     return 1;
 }
 
+/****************************************************************
+* wifi_event_mac_in_list
+*
+* Case-insensitive search for a MAC address string in a 2-D array.
+*
+* Parameters:
+*   mac    - MAC string to search for (e.g. "AA:BB:CC:DD:EE:FF")
+*   macs   - Array of MAC strings to search
+*   count  - Number of valid entries in macs[]
+*
+* Returns:
+*   1 if mac is found (case-insensitive), 0 otherwise.
+****************************************************************/
 static int wifi_event_mac_in_list(const char *mac, char macs[][18], int count) {
     int i = 0;
     for (i = 0; i < count; i++) {
@@ -945,7 +1231,25 @@ static int wifi_event_mac_in_list(const char *mac, char macs[][18], int count) {
     return 0;
 }
 
-/** Look up one MAC in /tmp/dhcp.leases; copy IP to ip_out if found. Returns 1 if IP set. */
+/****************************************************************
+* ap_client_lookup_ip
+*
+* Searches /tmp/dhcp.leases for a lease matching the given MAC
+* and copies its IP address to ip_out.
+*
+* Parameters:
+*   mac     - MAC address string to look up (case-insensitive)
+*   ip_out  - Output buffer to receive the IP string
+*   ip_len  - Size of ip_out; must be >= 8
+*
+* Returns:
+*   1 if a matching lease was found and IP was copied to ip_out,
+*   0 if not found, file missing, or ip_len < 8.
+*
+* Notes:
+*   Used by the non-blocking APJOIN pending retry logic to poll
+*   for a DHCP lease on each wifi_events_poll() tick.
+****************************************************************/
 static int ap_client_lookup_ip(const char *mac, char *ip_out, size_t ip_len) {
     FILE *fp = NULL;
     char line[256] = {0};
@@ -963,8 +1267,46 @@ static int ap_client_lookup_ip(const char *mac, char *ip_out, size_t ip_len) {
     return 0;
 }
 
+/*
+ * apjoin_pending: non-blocking DHCP retry table.
+ * When a client joins but has no IP yet, we record its MAC here and retry
+ * the lease lookup on subsequent poll ticks (every ~1 s from the select loop)
+ * rather than blocking with sleep().  After retries_left reaches 0 the event
+ * is fired with whatever IP (or "0.0.0.0") was found.
+ */
+#define APJOIN_PENDING_MAX  8
+static struct {
+    char mac[18];
+    int  retries_left;  /* decremented each poll tick; fire when 0 */
+} apjoin_pending[APJOIN_PENDING_MAX];
+static int apjoin_pending_count = 0;
+
 /****************************************************************
-* wifi_events_poll - call from main loop; emits +WIFI:APJOIN/APLEAVE/STACONN/STADISCONN
+* wifi_events_poll
+*
+* Called once per main-loop tick.  Compares the current WiFi state
+* against the previous snapshot (wifi_event_prev) and emits
+* unsolicited events for any changes:
+*
+*   +WIFI:APJOIN,<MAC>,<IP>       — new client associated with AP
+*   +WIFI:APLEAVE,<MAC>           — client left AP
+*   +WIFI:STACONN,<IP>,<SEC>      — STA connected and has IP
+*   +WIFI:STADISCONN,NOT_CONNECTED — STA lost connection
+*
+* APJOIN DHCP retry (non-blocking):
+*   When a client joins but has no IP yet, its MAC is added to the
+*   apjoin_pending[] table.  On each subsequent tick the lease file
+*   is re-checked.  The event fires as soon as an IP appears or
+*   after 3 retries (whichever comes first), keeping the event
+*   loop unblocked.
+*
+* Parameters:
+*   uart  - Open UART instance; events written directly via send_event()
+*
+* Notes:
+*   Not re-entrant; designed for single-threaded use.
+*   State is maintained in the static wifi_event_prev struct and
+*   the apjoin_pending[] table.
 ****************************************************************/
 void wifi_events_poll(uart_inst_t *uart) {
     char cur_macs[WIFI_EVENT_AP_CLIENTS_MAX][18];
@@ -972,24 +1314,44 @@ void wifi_events_poll(uart_inst_t *uart) {
     int cur_ap = 0;
     int cur_sta = 0;
     int i = 0;
-    int retries = 0;
+    int new_pending_count = 0;
     char cur_sta_ip[32] = "";
     char cur_sta_sec[16] = "OPEN";
 
     wifi_event_get_ap_clients(cur_macs, cur_ips, &cur_ap);
     cur_sta = wifi_event_get_sta_state(cur_sta_ip, sizeof(cur_sta_ip), cur_sta_sec, sizeof(cur_sta_sec));
 
-    /* APJOIN: in current, not in previous; if IP still 0.0.0.0, give DHCP a moment and re-lookup */
+    /* --- Process pending APJOIN retries (non-blocking DHCP wait) --- */
+    new_pending_count = 0;
+    for (i = 0; i < apjoin_pending_count; i++) {
+        char ip[16] = "0.0.0.0";
+        int got_ip = ap_client_lookup_ip(apjoin_pending[i].mac, ip, sizeof(ip));
+        if (got_ip || apjoin_pending[i].retries_left <= 0) {
+            send_event(uart, "+WIFI:APJOIN,%s,%s", apjoin_pending[i].mac,
+                       (got_ip && ip[0]) ? ip : "0.0.0.0");
+        } else {
+            apjoin_pending[i].retries_left--;
+            apjoin_pending[new_pending_count++] = apjoin_pending[i];
+        }
+    }
+    apjoin_pending_count = new_pending_count;
+
+    /* APJOIN: in current, not in previous */
     for (i = 0; i < cur_ap; i++) {
         if (!wifi_event_mac_in_list(cur_macs[i], wifi_event_prev.ap_macs, wifi_event_prev.ap_count)) {
-            if (!cur_ips[i][0] || strcmp(cur_ips[i], "0.0.0.0") == 0) {
-                retries = 3;
-                while (retries-- > 0) {
-                    sleep(1);
-                    if (ap_client_lookup_ip(cur_macs[i], cur_ips[i], 16)) break;
-                }
+            if (cur_ips[i][0] && strcmp(cur_ips[i], "0.0.0.0") != 0) {
+                /* IP already available - fire immediately */
+                send_event(uart, "+WIFI:APJOIN,%s,%s", cur_macs[i], cur_ips[i]);
+            } else if (apjoin_pending_count < APJOIN_PENDING_MAX) {
+                /* Defer: retry on subsequent poll ticks */
+                strncpy(apjoin_pending[apjoin_pending_count].mac, cur_macs[i], 17);
+                apjoin_pending[apjoin_pending_count].mac[17] = '\0';
+                apjoin_pending[apjoin_pending_count].retries_left = 3;
+                apjoin_pending_count++;
+            } else {
+                /* Pending table full - fire now with no IP */
+                send_event(uart, "+WIFI:APJOIN,%s,0.0.0.0", cur_macs[i]);
             }
-            send_event(uart, "+WIFI:APJOIN,%s,%s", cur_macs[i], cur_ips[i][0] ? cur_ips[i] : "0.0.0.0");
         }
     }
     /* APLEAVE: in previous, not in current */
@@ -1037,7 +1399,19 @@ static struct {
     int  client_count;
 } eth_event_prev;
 
-/** Fill reachable_macs with MACs currently in neighbour table (REACHABLE/STALE) on br-lan/eth0. */
+/****************************************************************
+* eth_get_reachable_macs
+*
+* Fills reachable_macs with the MAC addresses currently present in
+* the Linux ARP neighbour table with state REACHABLE or STALE on
+* br-lan and eth0.  Used to cross-reference /tmp/dhcp.leases so
+* only actively-reachable clients are reported.
+*
+* Parameters:
+*   reachable_macs  - Output 2-D array; caller must size to
+*                     ETH_EVENT_CLIENTS_MAX entries of 18 bytes
+*   count           - Output: number of entries filled
+****************************************************************/
 static void eth_get_reachable_macs(char reachable_macs[][18], int *count) {
     FILE *fp = NULL;
     char line[256] = {0};
@@ -1063,7 +1437,17 @@ static void eth_get_reachable_macs(char reachable_macs[][18], int *count) {
     }
 }
 
-/** Get LAN IPv4: on OpenWrt the address is usually on br-lan (bridge), not eth0. Try br-lan then eth0. */
+/****************************************************************
+* eth_get_lan_ip
+*
+* Reads the first IPv4 address assigned to the LAN interface.
+* Tries br-lan first (the default OpenWrt bridge), then falls back
+* to eth0.  Writes an empty string to ip if no address is found.
+*
+* Parameters:
+*   ip      - Output buffer for the IPv4 address string
+*   ip_len  - Size of ip buffer
+****************************************************************/
 static void eth_get_lan_ip(char *ip, size_t ip_len) {
     FILE *fp=NULL;
     char line[256]={0};
@@ -1091,6 +1475,27 @@ static void eth_get_lan_ip(char *ip, size_t ip_len) {
     }
 }
 
+/****************************************************************
+* eth_event_get_state
+*
+* Reads the complete current Ethernet state in one call:
+*   - carrier: whether /sys/class/net/eth0/carrier reads 1
+*   - ip:      LAN IPv4 address (br-lan or eth0)
+*   - macs/ips: list of DHCP clients that also appear as
+*               REACHABLE/STALE in the ARP neighbour table
+*
+* Parameters:
+*   carrier       - Output: 1 if link is up, 0 if down
+*   ip            - Output: LAN IP string (empty if none)
+*   ip_len        - Size of ip buffer
+*   macs          - Output: client MAC array
+*   ips           - Output: client IP array (parallel to macs)
+*   client_count  - Output: number of valid entries in macs/ips
+*
+* Notes:
+*   Returns immediately with carrier=0 if link is down; macs and
+*   ips are not filled in that case.
+****************************************************************/
 static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
                                 char macs[][18], char ips[][16], int *client_count) {
     FILE *fp = NULL;
@@ -1140,6 +1545,20 @@ static void eth_event_get_state(int *carrier, char *ip, size_t ip_len,
     fp = NULL;
 }
 
+/****************************************************************
+* eth_event_mac_in_list
+*
+* Case-insensitive search for a MAC address in a 2-D array.
+* Ethernet counterpart of wifi_event_mac_in_list.
+*
+* Parameters:
+*   mac    - MAC string to search for
+*   macs   - Array of MAC strings to search
+*   count  - Number of valid entries in macs[]
+*
+* Returns:
+*   1 if found, 0 otherwise.
+****************************************************************/
 static int eth_event_mac_in_list(const char *mac, char macs[][18], int count) {
     int i;
     for (i = 0; i < count; i++)
@@ -1147,13 +1566,44 @@ static int eth_event_mac_in_list(const char *mac, char macs[][18], int count) {
     return 0;
 }
 
+/*
+ * eth_up_pending: non-blocking DHCP wait for +ETH:UP event.
+ * When the Ethernet carrier comes up but no IP is assigned yet we defer
+ * the +ETH:UP event and retry on subsequent poll ticks instead of sleeping.
+ */
+static struct {
+    int active;         /* 1 = waiting for IP before firing +ETH:UP */
+    int retries_left;   /* fire (with 0.0.0.0 if needed) when this hits 0 */
+} eth_up_pending = {0, 0};
+
 /****************************************************************
-* eth_events_poll - emits +ETH:UP, +ETH:DOWN, +ETH:CLIENT, +ETH:CLIENT_LEAVE
+* eth_events_poll
+*
+* Called once per main-loop tick.  Compares the current Ethernet
+* state against the previous snapshot (eth_event_prev) and emits
+* unsolicited events for any changes:
+*
+*   +ETH:UP,<PORT>,IP=<ip>        — carrier came up
+*   +ETH:DOWN,<PORT>              — carrier went down
+*   +ETH:CLIENT,<PORT>,<MAC>,<IP> — new LAN client with DHCP lease
+*   +ETH:CLIENT_LEAVE,<PORT>,<MAC>— LAN client left (ARP gone)
+*
+* ETH UP DHCP retry (non-blocking):
+*   When the carrier comes up but no IP is assigned yet, the
+*   eth_up_pending state defers the +ETH:UP event for up to 5
+*   poll ticks (~5 s).  The event fires as soon as an IP appears
+*   or retries are exhausted, without blocking the event loop.
+*
+* Parameters:
+*   uart  - Open UART instance; events written via send_event()
+*
+* Notes:
+*   Not re-entrant; designed for single-threaded use.
+*   State is maintained in eth_event_prev and eth_up_pending.
 ****************************************************************/
 void eth_events_poll(uart_inst_t *uart) {
     int carrier = 0;
     int i = 0;
-    int retries = 0;
     int cur_count = 0;
     char ip[32] = "";
     char cur_macs[ETH_EVENT_CLIENTS_MAX][18];
@@ -1161,18 +1611,28 @@ void eth_events_poll(uart_inst_t *uart) {
 
     eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
 
-    if (carrier && !eth_event_prev.carrier) {
-        /* Link just came up: if no IP yet, give DHCP time then re-read (e.g. on boot) */
-        if (!ip[0] || strcmp(ip, "0.0.0.0") == 0) {
-            retries = 5;   /* 5 x 1s = up to 5s for DHCP */
-            while (retries-- > 0) {
-                sleep(1);
-                eth_event_get_state(&carrier, ip, sizeof(ip), cur_macs, cur_ips, &cur_count);
-                if (ip[0] && strcmp(ip, "0.0.0.0") != 0) break;
-            }
+    /* --- Resolve pending ETH UP (waiting for DHCP) --- */
+    if (eth_up_pending.active) {
+        if (!carrier) {
+            /* Link dropped before we got an IP - cancel and fall through to DOWN */
+            eth_up_pending.active = 0;
+        } else if ((ip[0] && strcmp(ip, "0.0.0.0") != 0) || eth_up_pending.retries_left <= 0) {
+            send_event(uart, "+ETH:UP,%d,IP=%s", ETH_PORT, (ip[0] && strcmp(ip, "0.0.0.0") != 0) ? ip : "0.0.0.0");
+            eth_up_pending.active = 0;
+        } else {
+            eth_up_pending.retries_left--;
         }
-        send_event(uart, "+ETH:UP,%d,IP=%s", ETH_PORT, ip[0] ? ip : "0.0.0.0");
+    } else if (carrier && !eth_event_prev.carrier) {
+        /* Link just came up */
+        if (ip[0] && strcmp(ip, "0.0.0.0") != 0) {
+            send_event(uart, "+ETH:UP,%d,IP=%s", ETH_PORT, ip);
+        } else {
+            /* No IP yet - defer for up to 5 poll ticks (~5 s) */
+            eth_up_pending.active = 1;
+            eth_up_pending.retries_left = 5;
+        }
     } else if (!carrier && eth_event_prev.carrier) {
+        eth_up_pending.active = 0;
         send_event(uart, "+ETH:DOWN,%d", ETH_PORT);
     }
 
@@ -1199,14 +1659,28 @@ void eth_events_poll(uart_inst_t *uart) {
     }
 }
 
-/**
- * AT+ETH? - Query Ethernet link status, IP, client count and list (spec 274-300)
- * Response when DOWN: +ETH:DOWN then OK
- * Response when UP:   +ETH:UP,IP=<ip>,CLIENTS=<n> then +ETH:CLIENT,<PORT>,<MAC>,<IP> per client then OK
- * PORT = physical Ethernet port number (1-based); MT7628 single LAN = port 1
- */
 /****************************************************************
 * cmd_eth_query
+*
+* Handles: AT+ETH?
+*
+* Reports current Ethernet link state, the LAN IP address, and
+* the list of active DHCP clients that are also present in the
+* ARP neighbour table.
+*
+* Response when DOWN:
+*   +ETH:DOWN
+*   OK
+*
+* Response when UP:
+*   +ETH:UP,IP=<ip>,CLIENTS=<n>
+*   +ETH:CLIENT,1,<MAC>,<IP>    (one line per active client)
+*   OK
+*
+* PORT is always 1 (MT7628N has one physical LAN port).
+*
+* Parameters:
+*   uart  - UART instance for sending the response
 ****************************************************************/
 typedef struct {
     char mac[32];
@@ -1283,40 +1757,69 @@ static void cmd_eth_query(uart_inst_t *uart) {
     send_response(uart, "OK");
 }
 
-/**
- * AT+RST - Software reset (Linux reboot)
- */
 /****************************************************************
 * cmd_reset
+*
+* Handles: AT+RST
+*
+* Sends OK immediately (before the reboot), then issues
+* `reboot &` asynchronously so the UART response is transmitted
+* before the system goes down.  After reboot the daemon
+* re-initialises and sends +SYS:BOOT,READY.
+*
+* Parameters:
+*   uart  - UART instance for sending the response
 ****************************************************************/
 static void cmd_reset(uart_inst_t *uart) {
     send_response(uart, "OK");
     system("reboot &");
 }
 
-/**
- * AT+FACTORY - Factory reset and reboot
- */
 /****************************************************************
 * cmd_factory
+*
+* Handles: AT+FACTORY
+*
+* Sends OK immediately, then runs `firstboot -y && reboot &`
+* asynchronously.  `firstboot` wipes all overlay changes (UCI
+* config, installed packages, etc.) restoring factory defaults.
+* After reboot, +SYS:BOOT,READY is sent again.
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Warning:
+*   This is destructive and irreversible — all user configuration
+*   is erased.
 ****************************************************************/
 static void cmd_factory(uart_inst_t *uart) {
     send_response(uart, "OK");
     system("firstboot -y && reboot &");
 }
 
-/**
- * AT+SAVE - Save configuration to non-volatile (spec 333-341). Response: OK or ERROR.
- */
 /****************************************************************
 * cmd_save
+*
+* Handles: AT+SAVE
+*
+* Commits all pending UCI changes to non-volatile storage by
+* running `uci commit`.  Under normal operation each UCI write
+* (AT+WIFIAPCFG, AT+WIFISTACFG, etc.) already commits its own
+* package, so this command is provided as an explicit flush
+* for any changes left uncommitted.
+*
+* Parameters:
+*   uart  - UART instance for sending the response
+*
+* Response:
+*   OK on success; ERROR:2 if `uci commit` exits non-zero.
 ****************************************************************/
 static void cmd_save(uart_inst_t *uart) {
     int ret = system("uci commit");
     if (ret == 0) {
         send_response(uart, "OK");
     } else {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_CMD_FAILED);
     }
 }
 
@@ -1325,6 +1828,20 @@ static void cmd_save(uart_inst_t *uart) {
  *============================================================================*/
 /****************************************************************
 * command_callback
+*
+* UART line callback registered by atcmd_init().  Invoked by
+* uart_process_events() for every complete AT command line
+* received from the STM32 master.
+*
+* Dispatches by exact string match (for query/action commands) or
+* strncmp prefix match (for parameterised set commands).
+* Unrecognised commands reply with ERROR:6 (NOT_SUPPORTED).
+* Empty lines are silently ignored.
+*
+* Parameters:
+*   uart       - UART instance (forwarded to send_response())
+*   line       - Null-terminated AT command line (no \r\n)
+*   user_data  - Unused; reserved for future use
 ****************************************************************/
 static void command_callback(uart_inst_t *uart, const char *line, void *user_data) {
     (void)user_data;
@@ -1335,7 +1852,7 @@ static void command_callback(uart_inst_t *uart, const char *line, void *user_dat
         send_response(uart, "OK");
     }
     else if (strcmp(line, "AT+VER?") == 0) {
-        send_response(uart, "+VER:MT7628N-AT-1.2.0");
+        send_response(uart, "+VER:%s", AT_VERSION);
         send_response(uart, "OK");
     }
     else if (strcmp(line, "AT+RST") == 0) {
@@ -1378,12 +1895,25 @@ static void command_callback(uart_inst_t *uart, const char *line, void *user_dat
         cmd_save(uart);
     }
     else {
-        send_response(uart, "ERROR");
+        send_response(uart, ERR_NOT_SUPPORTED);
     }
 }
 
 /****************************************************************
 * atcmd_init
+*
+* Initialises the AT command subsystem.
+*
+* Registers command_callback on the UART instance so every
+* received line is dispatched to the AT command handlers.
+* Sends the +SYS:BOOT,READY event to notify the STM32 master
+* that the daemon is up and ready to accept commands.
+*
+* Must be called once after uart_open() and before the main
+* select() loop starts.
+*
+* Parameters:
+*   uart  - Open and configured UART instance
 ****************************************************************/
 void atcmd_init(uart_inst_t *uart) {
     uart_register_callback(uart, "", command_callback, NULL);
